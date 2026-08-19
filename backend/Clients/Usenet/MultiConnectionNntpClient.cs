@@ -114,6 +114,8 @@ public class MultiConnectionNntpClient(
     public int IdleConnections => connectionPool.IdleConnections;
     public int ActiveConnections => connectionPool.ActiveConnections;
     public int AvailableConnections => connectionPool.AvailableConnections;
+    public ProviderConnectionAdmissionSnapshot? GetConnectionAdmissionSnapshot() =>
+        _connectionAdmission?.GetSnapshot();
     public int InFlightConnections => ActiveConnections + PendingSelections;
     public ConnectionPoolChurn GetConnectionChurn() => connectionPool.GetChurn();
 
