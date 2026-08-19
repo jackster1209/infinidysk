@@ -242,29 +242,56 @@ public abstract class NntpClient : INntpClient
         CancellationToken cancellationToken
     )
     {
+        if (concurrency < 1)
+            throw new ArgumentException("concurrency must be greater than zero.");
+
         using var childCt = ContextualCancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var token = childCt.Token;
-
-        var tasks = segmentIds
-            .Select(async segmentId => (
-                SegmentId: segmentId,
-                Result: await StatAsync(segmentId, token).ConfigureAwait(false)
-            ))
-            .WithConcurrencyAsync(concurrency, token);
-
+        using var segments = segmentIds.GetEnumerator();
+        var segmentsLock = new Lock();
         var processed = 0;
-        await foreach (var task in tasks.ConfigureAwait(false))
+
+        // A fixed worker owns each live slot and immediately pulls another segment
+        // after STAT completes. Completed results therefore cannot occupy concurrency
+        // capacity while the caller processes progress, as they can in a task set.
+        async Task WorkerAsync()
         {
-            progress?.Report(++processed);
-            if (task.Result.ResponseType == UsenetResponseType.ArticleExists) continue;
-            await childCt.CancelAsync().ConfigureAwait(false);
+            try
+            {
+                while (true)
+                {
+                    string segmentId;
+                    lock (segmentsLock)
+                    {
+                        token.ThrowIfCancellationRequested();
+                        if (!segments.MoveNext()) return;
+                        segmentId = segments.Current;
+                    }
+
+                    var result = await StatAsync(segmentId, token).ConfigureAwait(false);
+                    progress?.Report(Interlocked.Increment(ref processed));
+                    if (result.ResponseType == UsenetResponseType.ArticleExists) continue;
 
             // Definitive missing (430 / provider 451) fails the health check; any other
             // response (e.g. a stale connection's goodbye line) must stay retryable.
-            if (UsenetArticleAvailability.IsDefinitiveMissing(task.Result))
-                throw new UsenetArticleNotFoundException(task.SegmentId, task.Result.ResponseMessage);
-            throw new UsenetUnexpectedResponseException(task.SegmentId, task.Result.ResponseMessage);
+                    if (UsenetArticleAvailability.IsDefinitiveMissing(result))
+                        throw new UsenetArticleNotFoundException(segmentId, result.ResponseMessage);
+                    throw new UsenetUnexpectedResponseException(segmentId, result.ResponseMessage);
         }
+    }
+            catch (Exception e) when (e is not OutOfMemoryException)
+            {
+                // Stop source materialization and drain every sibling worker before the
+                // authoritative failure escapes Task.WhenAll.
+                await childCt.CancelAsync().ConfigureAwait(false);
+                throw;
+            }
+        }
+
+        var workers = Enumerable.Range(0, concurrency)
+            .Select(_ => WorkerAsync())
+            .ToArray();
+        await Task.WhenAll(workers).ConfigureAwait(false);
     }
 
     public virtual async IAsyncEnumerable<PipelinedStatResult> StatsPipelinedAsync

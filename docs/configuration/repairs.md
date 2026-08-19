@@ -12,7 +12,8 @@ Background health monitoring and replacement of unhealthy library items.
 | Control | Config key | Default | Effect |
 |---------|------------|---------|--------|
 | Enable Background Repairs | `repair.enable` | off | Needs library dir + *Arr |
-| Health Check Concurrency [since 0.9.0](https://github.com/infinidysk/infinidysk/releases/tag/v0.9.0){ .nzbdav-since } | `repair.healthcheck-concurrency` | `50` | Worker ceiling for concurrent STAT checks; capped by the provider pool. Actual contention with playback is governed by provider-pool admission and **Streaming Priority** |
+| Maximum Health Check Connections [since 0.9.0](https://github.com/infinidysk/infinidysk/releases/tag/v0.9.0){ .nzbdav-since } | `repair.healthcheck-concurrency` | `50` | Since 1.2.0, an aggregate NNTP verification limit shared by background checks and queue article validation. Effective use is limited to 1–200 and the total pooled provider capacity |
+| Concurrent Health Checks [since 1.2.0](https://github.com/infinidysk/infinidysk/releases/tag/v1.2.0){ .nzbdav-since } | `repair.healthcheck-workers` | `1` | Library files checked at once (1–8). All workers share the aggregate connection limit above; this setting never multiplies it |
 | Health Check Depth | `repair.healthcheck-depth` | `standard` | standard / enhanced / deep / complete |
 | Check older releases less thoroughly [since 0.8.0](https://github.com/infinidysk/infinidysk/releases/tag/v0.8.0){ .nzbdav-since } | `repair.healthcheck-aging` | off | Aging taper |
 | Repair After Streaming Failures | `repair.auto-remove-after-failures` | `0` | Consecutive streaming failures before urgent repair; `0` = immediate repair |
@@ -23,6 +24,24 @@ Background health monitoring and replacement of unhealthy library items.
 | Max total missing segments | `repair.degraded-max-total-missing` | `5` | Total tolerable holes per file (1–1000) |
 | Max missing data (% of file) | `repair.degraded-max-missing-byte-percent` | `1.0` | Tolerable hole share of file bytes (0.01–50) |
 | Library Directory | `media.library-dir` | empty | Organized library root in the container — parent of your Arr root folders. Never the rclone mount or `/completed-symlinks` |
+
+## Parallel health scheduling [since 1.2.0](https://github.com/infinidysk/infinidysk/releases/tag/v1.2.0){ .nzbdav-since }
+
+`repair.healthcheck-workers` controls how many library files can make progress at once.
+`repair.healthcheck-concurrency` remains the connection-pressure control, but is now shared by
+every background worker and queue article-existence validation. For example, four workers with a
+50-connection limit share those 50 admissions rather than receiving 50 each.
+
+Existing numeric `repair.healthcheck-concurrency` values remain valid during upgrades, including
+headless values outside the current effective range. InfiniDysk safely limits them at runtime to at
+least one, at most 200, and no more than the total pooled provider capacity. Existing Compose files
+therefore do not need to be changed before starting the new version.
+
+Routine verification may run alongside queue processing only when every enabled provider uses the
+split Transfer/Metadata connection model. Pending playback-triggered urgent repairs retain their
+priority but wait until the queue is idle. If routine verification discovers repair work while the
+queue remains active, it waits for up to five minutes and then records an Action Needed result for a
+retry 15 minutes later. Repair work that has already started is allowed to finish.
 
 ## Re-check after provider changes [since 1.2.0](https://github.com/infinidysk/infinidysk/releases/tag/v1.2.0){ .nzbdav-since }
 

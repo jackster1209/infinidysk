@@ -60,6 +60,11 @@ public sealed class PrometheusMetrics
     private readonly Counter _sharedStreamReadersServed;
     private readonly Counter _privateFallbacks;
     private readonly Counter _streamingCorruptSegments;
+    private readonly Gauge _healthCheckGateLimit;
+    private readonly Gauge _healthCheckGateActive;
+    private readonly Gauge _healthCheckGatePeakActive;
+    private readonly Gauge _healthCheckGateWaiting;
+    private readonly Gauge _healthCheckGatePeakWaiting;
     private readonly HashSet<string> _providerKeys = new(StringComparer.Ordinal);
 
     public PrometheusMetrics(CollectorRegistry registry)
@@ -167,6 +172,23 @@ public sealed class PrometheusMetrics
         _streamingCorruptSegments = metrics.CreateCounter(
             "nzbdav_streaming_corrupt_segments_total",
             "Streaming-confirmed corrupt Usenet articles.");
+        _healthCheckGateLimit = metrics.CreateGauge(
+            "nzbdav_health_check_gate_limit",
+            "Current aggregate health verification admission limit.");
+        _healthCheckGateActive = metrics.CreateGauge(
+            "nzbdav_health_check_gate_active",
+            "Current admitted health verification operations.");
+        _healthCheckGatePeakActive = metrics.CreateGauge(
+            "nzbdav_health_check_gate_peak_active",
+            "Maximum admitted health verification operations since the previous metrics refresh.");
+        _healthCheckGateWaiting = metrics.CreateGauge(
+            "nzbdav_health_check_gate_waiting",
+            "Current health verification operations waiting for admission.",
+            new GaugeConfiguration { LabelNames = ["priority"] });
+        _healthCheckGatePeakWaiting = metrics.CreateGauge(
+            "nzbdav_health_check_gate_peak_waiting",
+            "Maximum health verification operations waiting for admission since the previous metrics refresh.",
+            new GaugeConfiguration { LabelNames = ["priority"] });
     }
 
     public static PrometheusMetrics? Current { get; set; }
@@ -203,6 +225,17 @@ public sealed class PrometheusMetrics
     public void RecordPar2PatchEviction() => _par2PatchEvictions.Inc();
 
     public void RecordStreamingCorruptSegment() => _streamingCorruptSegments.Inc();
+
+    internal void SetHealthCheckGate(HealthCheckConnectionGateSnapshot snapshot)
+    {
+        _healthCheckGateLimit.Set(snapshot.Limit);
+        _healthCheckGateActive.Set(snapshot.Active);
+        _healthCheckGatePeakActive.Set(snapshot.PeakActive);
+        _healthCheckGateWaiting.WithLabels("queue").Set(snapshot.WaitingQueue);
+        _healthCheckGateWaiting.WithLabels("background").Set(snapshot.WaitingBackground);
+        _healthCheckGatePeakWaiting.WithLabels("queue").Set(snapshot.PeakWaitingQueue);
+        _healthCheckGatePeakWaiting.WithLabels("background").Set(snapshot.PeakWaitingBackground);
+    }
 
     public void Refresh(
         ActiveReadRegistry activeReads,

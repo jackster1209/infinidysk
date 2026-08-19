@@ -42,6 +42,7 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
     private RepairPatchStore _patchStore = null!;
     private UsenetStreamingClient _usenet = null!;
     private QueueManager _queueManager = null!;
+    private HealthCheckConnectionGate _healthCheckConnectionGate = null!;
 
     public async Task InitializeAsync()
     {
@@ -78,6 +79,7 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         Directory.CreateDirectory(Path.Join(_configRoot, "library"));
 
         _failureTracker = new StreamingFailureTracker();
+        _healthCheckConnectionGate = new HealthCheckConnectionGate(_configManager);
         _patchStore = new RepairPatchStore(Path.Join(_configRoot, "patches"), 1024 * 1024);
         await _patchStore.CatalogLoadTask;
 
@@ -90,7 +92,7 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
             new ProviderBytesTracker(),
             new StreamTraceBuffer(100),
             new ActiveReadRegistry());
-        _queueManager = new QueueManager(
+        _queueManager = QueueManager.CreateForTests(
             _usenet,
             _configManager,
             websocketManager,
@@ -98,12 +100,14 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
             new WatchdogLog(),
             new QueueItemSourceTracker(),
             new BenchmarkGate(),
-            startLoop: false);
+            startLoop: false,
+            healthCheckConnectionGate: _healthCheckConnectionGate);
     }
 
     public async Task DisposeAsync()
     {
         _queueManager.Dispose();
+        _healthCheckConnectionGate.Dispose();
         _usenet.Dispose();
         await _context.DisposeAsync();
         Environment.SetEnvironmentVariable("CONFIG_PATH", _previousConfigPath);
@@ -280,6 +284,159 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         Assert.Equal(oldBlobId, ReloadItem(item.Id).FileBlobId);
         Assert.Throws<UsenetArticleNotFoundException>(
             () => HealthCheckService.CheckCachedMissingSegmentIds([segments[50]]));
+    }
+
+    [Fact]
+    public async Task RoutineMissingArticle_WaitsForQueueIdleBeforeStartingRepair()
+    {
+        var segments = NewSegmentIds(HealthCheckService.SampleFloor + 1000);
+        var sizes = Enumerable.Repeat(100L, segments.Length).ToArray();
+        var (item, _) = await AddVideoFileAsync("movie.mkv", segments, sizes);
+        var fake = NewFakeClient(segments, missing: [50]);
+        var (service, par2) = await NewServiceAsync(fake, par2Outcome: false);
+        var queueActive = true;
+        var waitEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        service.CoordinatorPollInterval = TimeSpan.FromMilliseconds(10);
+        service.HasActiveQueueItemsOverride = () =>
+        {
+            waitEntered.TrySetResult();
+            return queueActive;
+        };
+
+        var healthCheck = service.PerformHealthCheck(
+            item,
+            _dbClient,
+            concurrency: 4,
+            CancellationToken.None);
+        await waitEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.False(healthCheck.IsCompleted);
+        Assert.Empty(par2.Requests);
+
+        queueActive = false;
+        await healthCheck.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.Single(par2.Requests);
+        Assert.Equal(
+            HealthCheckResult.HealthResult.Unhealthy,
+            Assert.Single(GetHealthRows(item.Id)).Result);
+    }
+
+    [Fact]
+    public async Task RoutineMissingArticle_DefersWhenQueueDoesNotBecomeIdle()
+    {
+        var segments = NewSegmentIds(HealthCheckService.SampleFloor + 1000);
+        var sizes = Enumerable.Repeat(100L, segments.Length).ToArray();
+        var (item, _) = await AddVideoFileAsync("movie.mkv", segments, sizes);
+        var fake = NewFakeClient(segments, missing: [50]);
+        var (service, par2) = await NewServiceAsync(fake, par2Outcome: false);
+        service.CoordinatorPollInterval = TimeSpan.FromMilliseconds(5);
+        service.RepairQueueIdleTimeout = TimeSpan.FromMilliseconds(30);
+        service.RepairQueueIdleLogInterval = TimeSpan.FromMilliseconds(10);
+        service.RepairQueueRetryDelay = TimeSpan.FromMinutes(2);
+        service.HasActiveQueueItemsOverride = () => true;
+
+        await service.PerformHealthCheck(
+            item,
+            _dbClient,
+            concurrency: 4,
+            CancellationToken.None);
+
+        Assert.Empty(par2.Requests);
+        var row = Assert.Single(GetHealthRows(item.Id));
+        Assert.Equal(HealthCheckResult.HealthResult.Unhealthy, row.Result);
+        Assert.Equal(HealthCheckResult.RepairAction.ActionNeeded, row.RepairStatus);
+        Assert.Contains("queue work remained active", row.Message);
+        Assert.True(ReloadItem(item.Id).NextHealthCheck > DateTimeOffset.UtcNow);
+    }
+
+    [Fact]
+    public async Task UrgentRepair_AlreadyAdmitted_DoesNotConsultQueueIdle()
+    {
+        var segments = NewSegmentIds(6);
+        var sizes = Enumerable.Repeat(100L, segments.Length).ToArray();
+        var (item, _) = await AddVideoFileAsync("urgent.mkv", segments, sizes);
+        item.NextHealthCheck = DateTimeOffset.UnixEpoch;
+        await _context.SaveChangesAsync();
+        var fake = NewFakeClient(segments, missing: []);
+        var (service, _) = await NewServiceAsync(fake, par2Outcome: false);
+        service.HasActiveQueueItemsOverride = () =>
+            throw new InvalidOperationException("Urgent repair consulted the routine queue-idle boundary.");
+
+        await service.PerformHealthCheck(
+            item,
+            _dbClient,
+            concurrency: 4,
+            CancellationToken.None);
+
+        Assert.Empty(fake.StatRequestCounts);
+        var row = Assert.Single(GetHealthRows(item.Id));
+        Assert.Equal(HealthCheckResult.HealthResult.Unhealthy, row.Result);
+        Assert.Equal(HealthCheckResult.RepairAction.ActionNeeded, row.RepairStatus);
+        Assert.DoesNotContain("queue work remained active", row.Message);
+    }
+
+    [Fact]
+    public async Task ConfirmedHoleRepair_DefersWhenQueueDoesNotBecomeIdle()
+    {
+        var segments = NewSegmentIds(6);
+        var sizes = new long[] { 10_000, 10_000, 50, 50, 50, 10_000 };
+        var (item, oldBlobId) = await AddVideoFileAsync("movie.mkv", segments, sizes);
+        var fake = NewFakeClient(segments, missing: [2, 3, 4]);
+        var (service, par2) = await NewServiceAsync(fake, par2Outcome: false);
+        service.CoordinatorPollInterval = TimeSpan.FromMilliseconds(5);
+        service.RepairQueueIdleTimeout = TimeSpan.FromMilliseconds(30);
+        service.RepairQueueIdleLogInterval = TimeSpan.FromMilliseconds(10);
+        service.RepairQueueRetryDelay = TimeSpan.FromMinutes(2);
+        service.HasActiveQueueItemsOverride = () => true;
+
+        await service.PerformHealthCheck(
+            item,
+            _dbClient,
+            concurrency: 4,
+            CancellationToken.None);
+
+        Assert.Empty(par2.Requests);
+        Assert.Equal(oldBlobId, ReloadItem(item.Id).FileBlobId);
+        var row = Assert.Single(GetHealthRows(item.Id));
+        Assert.Equal(HealthCheckResult.HealthResult.Unhealthy, row.Result);
+        Assert.Equal(HealthCheckResult.RepairAction.ActionNeeded, row.RepairStatus);
+        Assert.Contains("queue work remained active", row.Message);
+    }
+
+    [Fact]
+    public async Task RepairAlreadyStarted_FinishesWhenQueueBecomesActive()
+    {
+        var segments = NewSegmentIds(HealthCheckService.SampleFloor + 1000);
+        var sizes = Enumerable.Repeat(100L, segments.Length).ToArray();
+        var (item, _) = await AddVideoFileAsync("movie.mkv", segments, sizes);
+        var fake = NewFakeClient(segments, missing: [50]);
+        var (service, par2) = await NewServiceAsync(fake, par2Outcome: false);
+        var queueActive = false;
+        var repairStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var finishRepair = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        service.HasActiveQueueItemsOverride = () => queueActive;
+        par2.BeforeResultAsync = async ct =>
+        {
+            repairStarted.TrySetResult();
+            await finishRepair.Task.WaitAsync(ct);
+        };
+
+        var healthCheck = service.PerformHealthCheck(
+            item,
+            _dbClient,
+            concurrency: 4,
+            CancellationToken.None);
+        await repairStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        queueActive = true;
+        finishRepair.TrySetResult();
+        await healthCheck.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.Single(par2.Requests);
+        var row = Assert.Single(GetHealthRows(item.Id));
+        Assert.Equal(HealthCheckResult.HealthResult.Unhealthy, row.Result);
+        Assert.Equal(HealthCheckResult.RepairAction.ActionNeeded, row.RepairStatus);
+        Assert.DoesNotContain("queue work remained active", row.Message);
     }
 
     [Fact]
@@ -699,7 +856,8 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
             _failureTracker,
             _queueManager,
             par2,
-            _patchStore);
+            _patchStore,
+            _healthCheckConnectionGate);
         return (service, par2);
     }
 
@@ -803,12 +961,15 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         bool repairOutcome) : Par2RepairService(configManager, null!, store)
     {
         public List<string[]> Requests { get; } = [];
+        public Func<CancellationToken, Task>? BeforeResultAsync { get; set; }
 
-        public override Task<bool> TryPar2RepairAsync(
+        public override async Task<bool> TryPar2RepairAsync(
             DavItem davItem, IReadOnlyList<string>? missingSegmentIds, CancellationToken ct)
         {
             Requests.Add(missingSegmentIds?.ToArray() ?? []);
-            return Task.FromResult(repairOutcome);
+            if (BeforeResultAsync is { } beforeResult)
+                await beforeResult(ct);
+            return repairOutcome;
         }
     }
 }

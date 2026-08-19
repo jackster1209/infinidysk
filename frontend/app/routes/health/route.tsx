@@ -15,7 +15,11 @@ import type {
   HealthResult,
   RepairAction,
 } from "~/clients/backend-client.server";
-import { completeHealthCheck, type HealthQueueState } from "./health-queue-state";
+import {
+  completeHealthCheck,
+  type HealthQueueState,
+  updateHealthCheckProgress,
+} from "./health-queue-state";
 import { withUrlBase } from "~/utils/url-base";
 
 const topicNames = {
@@ -208,18 +212,9 @@ export default function Health({ loaderData }: Route.ComponentProps) {
     (message: string) => {
       const [davItemId, progress] = message.split("|");
       if (progress === "done") return;
-      setQueueState((queueState) => {
-        const index = queueState.items.findIndex((x) => x.id === davItemId);
-        if (index === -1) return queueState;
-        return {
-          ...queueState,
-          items: queueState.items
-            .filter((_, i) => i >= index)
-            .map((item) =>
-              item.id === davItemId ? { ...item, progress: Number(progress) } : item,
-            ),
-        };
-      });
+      setQueueState((queueState) =>
+        updateHealthCheckProgress(queueState, davItemId!, Number(progress)),
+      );
     },
     [setQueueState],
   );
