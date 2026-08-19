@@ -46,6 +46,7 @@ public class MultiConnectionConnectionBudgetTests
     [InlineData((int)NntpOperation.Head, (int)ProviderConnectionKind.Metadata)]
     [InlineData((int)NntpOperation.Date, (int)ProviderConnectionKind.Metadata)]
     [InlineData((int)NntpOperation.PipelinedStat, (int)ProviderConnectionKind.Metadata)]
+    [InlineData((int)NntpOperation.Control, (int)ProviderConnectionKind.Metadata)]
     public void ClassifyConnectionKind_UsesOperationSemantics(
         int operation,
         int expected)
