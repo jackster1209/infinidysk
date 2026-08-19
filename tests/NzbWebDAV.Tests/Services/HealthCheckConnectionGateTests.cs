@@ -1,11 +1,28 @@
+using NzbWebDAV.Clients.Usenet.Contexts;
 using NzbWebDAV.Config;
 using NzbWebDAV.Database.Models;
+using NzbWebDAV.Extensions;
 using NzbWebDAV.Services;
 
 namespace NzbWebDAV.Tests.Services;
 
 public sealed class HealthCheckConnectionGateTests
 {
+    [Fact]
+    public void ContextualTokenSource_PreservesHealthAdmissionContext()
+    {
+        var config = CreateConfig(1);
+        using var gate = new HealthCheckConnectionGate(config);
+        using var parent = new CancellationTokenSource();
+        var context = new HealthCheckAdmissionContext(
+            gate,
+            HealthCheckAdmissionPriority.Background);
+        using var registration = parent.Token.SetContext(context);
+        using var linked = ContextualCancellationTokenSource.CreateLinkedTokenSource(parent.Token);
+
+        Assert.Same(context, linked.Token.GetContext<HealthCheckAdmissionContext>());
+    }
+
     [Fact]
     public async Task AcquireAsync_EnforcesAggregateLimit()
     {

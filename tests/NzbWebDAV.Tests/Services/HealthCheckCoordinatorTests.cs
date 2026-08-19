@@ -64,6 +64,43 @@ public sealed class HealthCheckCoordinatorTests
     }
 
     [Fact]
+    public async Task Reservation_PreventsTwoWorkersClaimingTheSameItem()
+    {
+        using var harness = new Harness(workers: 2, fullySplit: false);
+        var id = Guid.NewGuid();
+        var blocker = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        harness.Service.SelectCandidateOverride = (_, _, _) => Task.FromResult<Guid?>(id);
+        harness.Service.ProcessCandidateOverride = (_, ct) => blocker.Task.WaitAsync(ct);
+
+        await harness.Service.RefillWorkerSlotsAsync(CancellationToken.None);
+
+        Assert.Equal(id, Assert.Single(harness.Service.InProgressHealthCheckIds));
+        blocker.TrySetResult();
+        await WaitUntilAsync(() => harness.Service.InProgressHealthCheckIds.Count == 0);
+    }
+
+    [Fact]
+    public async Task RaisingWorkerCount_FillsAdditionalSlots()
+    {
+        using var harness = new Harness(workers: 1, fullySplit: false);
+        var ids = new Queue<Guid>([Guid.NewGuid(), Guid.NewGuid()]);
+        var blocker = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        harness.Service.SelectCandidateOverride = (_, _, _) =>
+            Task.FromResult<Guid?>(ids.Count > 0 ? ids.Dequeue() : null);
+        harness.Service.ProcessCandidateOverride = (_, ct) => blocker.Task.WaitAsync(ct);
+
+        await harness.Service.RefillWorkerSlotsAsync(CancellationToken.None);
+        Assert.Single(harness.Service.InProgressHealthCheckIds);
+
+        harness.SetWorkers(2);
+        await harness.Service.RefillWorkerSlotsAsync(CancellationToken.None);
+
+        Assert.Equal(2, harness.Service.InProgressHealthCheckIds.Count);
+        blocker.TrySetResult();
+        await WaitUntilAsync(() => harness.Service.InProgressHealthCheckIds.Count == 0);
+    }
+
+    [Fact]
     public async Task LoweringWorkerCount_DoesNotCancelRunningWorkersOrStartReplacement()
     {
         using var harness = new Harness(workers: 2, fullySplit: false);
