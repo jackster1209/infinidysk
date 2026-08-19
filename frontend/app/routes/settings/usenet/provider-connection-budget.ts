@@ -19,14 +19,16 @@ export function calculateProviderConnectionBudget(
     }
 
     const baseMetadataCapacity = providerLimit - transferLimit;
-    const metadataBurstAllowance = Math.floor(transferLimit / 2);
+    const calculatedMetadataMax = baseMetadataCapacity + Math.floor(transferLimit / 2);
+    const maxMetadataCapacity = Math.min(providerLimit, Math.max(1, calculatedMetadataMax));
+    const metadataBurstAllowance = maxMetadataCapacity - baseMetadataCapacity;
 
     return {
         providerLimit,
         transferLimit,
         baseMetadataCapacity,
         metadataBurstAllowance,
-        maxMetadataCapacity: baseMetadataCapacity + metadataBurstAllowance,
+        maxMetadataCapacity,
     };
 }
 
