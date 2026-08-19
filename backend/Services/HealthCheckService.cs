@@ -72,11 +72,22 @@ public class HealthCheckService : BackgroundService
     private readonly RepairPatchStore _repairPatchStore;
     private readonly IDbContextFactory<DavDatabaseContext>? _dbContextFactory;
     private readonly HealthCheckConnectionGate _healthCheckConnectionGate;
+    private readonly ConcurrentDictionary<Guid, InProgressHealthCheck> _inProgress = new();
 
     private static readonly HashSet<string> _missingSegmentIds = [];
     private static readonly Queue<string> _missingSegmentOrder = [];
     private static readonly ConcurrentDictionary<Guid, int> _arrNoMatchConfirmations = new();
     private static readonly ConcurrentDictionary<string, List<DateTimeOffset>> _recentRepairRemovalsByPath = new();
+
+    internal TimeSpan CoordinatorPollInterval { get; set; } = TimeSpan.FromSeconds(1);
+    internal Func<DavDatabaseContext>? CreateDbContextOverride { get; set; }
+    internal Func<HashSet<Guid>, bool, CancellationToken, Task<Guid?>>? SelectCandidateOverride
+    { get; set; }
+    internal Func<Guid, CancellationToken, Task>? ProcessCandidateOverride { get; set; }
+    internal Func<bool>? HasActiveQueueItemsOverride { get; set; }
+    internal IReadOnlyCollection<Guid> InProgressHealthCheckIds => _inProgress.Keys.ToArray();
+
+    private DavDatabaseContext CreateDbContext() => DavDatabaseContexts.Create(CreateDbContextOverride);
 
     public HealthCheckService
     (
@@ -128,89 +139,185 @@ public class HealthCheckService : BackgroundService
 
         await ClearNonMediaHealthCheckEntriesAsync(stoppingToken).ConfigureAwait(false);
 
-        while (!stoppingToken.IsCancellationRequested)
+        try
         {
-            try
+            while (!stoppingToken.IsCancellationRequested)
             {
-                // pause verification while a connection speed-test is running
-                if (_benchmarkGate.IsPaused)
+                try
                 {
-                    await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken).ConfigureAwait(false);
-                    continue;
+                    await RefillWorkerSlotsAsync(stoppingToken).ConfigureAwait(false);
+                    await WaitForCoordinatorWakeAsync(stoppingToken).ConfigureAwait(false);
                 }
-
-                // if the repair-job is disabled, then don't do anything
-                if (!_configManager.IsRepairJobEnabled())
+                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
                 {
-                    await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken).ConfigureAwait(false);
-                    continue;
+                    break;
                 }
-
-                // Defer new background library health checks while the NZB queue
-                // is actively processing. An already-running check finishes normally;
-                // queue-item article validation inside QueueItemProcessor is separate.
-                if (_queueManager.HasActiveQueueItems)
+                catch (Exception e) when (e is not OutOfMemoryException)
                 {
-                    await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken).ConfigureAwait(false);
-                    continue;
-                }
-
-                // get concurrency (capped to avoid saturating the NNTP pool)
-                var concurrency = _configManager.GetHealthCheckConcurrency();
-                using var cts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
-
-                // get the davItem to health-check
-                await using var dbContext = CreateContext();
-                var dbClient = new DavDatabaseClient(dbContext);
-                var currentDateTime = DateTimeOffset.UtcNow;
-
-                // Stream the ordered queue and take the first media candidate.
-                // Urgent repairs (UnixEpoch sentinel) always run regardless of file type.
-                DavItem? davItem = null;
-                await foreach (var item in GetHealthCheckQueueItems(dbClient)
-                    .Where(x => x.NextHealthCheck == null || x.NextHealthCheck < currentDateTime)
-                    .AsAsyncEnumerable()
-                    .WithCancellation(cts.Token)
-                    .ConfigureAwait(false))
-                {
-                    if (item.NextHealthCheck == DateTimeOffset.UnixEpoch ||
-                        FilenameUtil.IsHealthCheckCandidate(item.Name))
+                    if (e.TryGetKnownErrorMessage(out var reason))
                     {
-                        davItem = item;
-                        break;
+                        Log.Warning("Background health coordinator deferred. Reason: {Reason}", reason);
+                        Log.Debug(e, "Background health coordinator known failure stack");
                     }
-                }
+                    else
+                    {
+                        Log.Error(
+                            e,
+                            "Unexpected error coordinating background health checks: {Message}",
+                            e.Message);
+                    }
 
-                // if there is no item to health-check, don't do anything
-                if (davItem == null)
-                {
-                    await Task.Delay(TimeSpan.FromSeconds(5), cts.Token).ConfigureAwait(false);
-                    continue;
+                    await Task.Delay(CoordinatorPollInterval, stoppingToken).ConfigureAwait(false);
                 }
-
-                // perform the health check
-                await PerformHealthCheck(davItem, dbClient, concurrency, cts.Token).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException) when (SigtermUtil.IsSigtermTriggered())
-            {
-                // OperationCanceledException is expected on sigterm
-                return;
-            }
-            catch (Exception e) when (e is not OutOfMemoryException)
-            {
-                if (e.TryGetKnownErrorMessage(out var reason))
-                {
-                    Log.Warning("Background health check deferred. Reason: {Reason}", reason);
-                    Log.Debug(e, "Background health check known failure stack");
-                }
-                else
-                {
-                    Log.Error(e, "Unexpected error performing background health checks: {Message}", e.Message);
-                }
-
-                await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken).ConfigureAwait(false);
             }
         }
+        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+        {
+            // Normal hosted-service shutdown.
+        }
+        finally
+        {
+            var workers = _inProgress.Values
+                .Select(worker => worker.ProcessingTask)
+                .Where(task => task is not null)
+                .Cast<Task>()
+                .ToArray();
+            if (workers.Length > 0)
+            {
+                try { await Task.WhenAll(workers).ConfigureAwait(false); }
+                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { }
+            }
+        }
+    }
+
+    internal async Task RefillWorkerSlotsAsync(CancellationToken ct)
+    {
+        while (_inProgress.Count < _configManager.GetHealthCheckWorkers())
+        {
+            if (_benchmarkGate.IsPaused || !_configManager.IsRepairJobEnabled()) return;
+
+            var queueActive = HasActiveQueueItems;
+            if (queueActive && !_configManager.CanBackgroundHealthCoexistWithQueue()) return;
+
+            var allowUrgentRepair = !queueActive;
+            var activeIds = _inProgress.Keys.ToHashSet();
+            var candidateId = SelectCandidateOverride is { } selector
+                ? await selector(activeIds, allowUrgentRepair, ct).ConfigureAwait(false)
+                : await SelectNextHealthCheckIdAsync(activeIds, allowUrgentRepair, ct)
+                    .ConfigureAwait(false);
+            if (candidateId is not { } id) return;
+
+            var worker = new InProgressHealthCheck();
+            if (!_inProgress.TryAdd(id, worker)) return;
+            worker.ProcessingTask = RunHealthCheckWorkerAsync(id, ct);
+        }
+    }
+
+    private async Task<Guid?> SelectNextHealthCheckIdAsync(
+        HashSet<Guid> activeIds,
+        bool allowUrgentRepair,
+        CancellationToken ct)
+    {
+        await using var dbContext = CreateDbContext();
+        var dbClient = new DavDatabaseClient(dbContext);
+        var currentDateTime = DateTimeOffset.UtcNow;
+        IQueryable<DavItem> queue = GetHealthCheckQueueItems(dbClient)
+            .Where(item => item.NextHealthCheck == null || item.NextHealthCheck < currentDateTime);
+        if (activeIds.Count > 0)
+            queue = queue.Where(item => !activeIds.Contains(item.Id));
+        if (!allowUrgentRepair)
+            queue = queue.Where(
+                item => item.NextHealthCheck != DateTimeOffset.UnixEpoch);
+
+        await foreach (var item in queue
+            .AsAsyncEnumerable()
+            .WithCancellation(ct)
+            .ConfigureAwait(false))
+        {
+            if (item.NextHealthCheck == DateTimeOffset.UnixEpoch
+                || FilenameUtil.IsHealthCheckCandidate(item.Name))
+            {
+                return item.Id;
+            }
+        }
+
+        return null;
+    }
+
+    private async Task RunHealthCheckWorkerAsync(Guid davItemId, CancellationToken ct)
+    {
+        try
+        {
+            if (ProcessCandidateOverride is { } processCandidate)
+            {
+                await processCandidate(davItemId, ct).ConfigureAwait(false);
+                return;
+            }
+
+            await using var dbContext = CreateDbContext();
+            var dbClient = new DavDatabaseClient(dbContext);
+            var davItem = await dbContext.Items
+                .SingleOrDefaultAsync(item => item.Id == davItemId, ct)
+                .ConfigureAwait(false);
+            if (davItem is null) return;
+
+            await PerformHealthCheck(
+                    davItem,
+                    dbClient,
+                    _configManager.GetHealthCheckConcurrency(),
+                    ct)
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // Normal hosted-service shutdown.
+        }
+        catch (Exception e) when (e is not OutOfMemoryException)
+        {
+            if (e.TryGetKnownErrorMessage(out var reason))
+            {
+                Log.Warning(
+                    "Background health check for {DavItemId} deferred. Reason: {Reason}",
+                    davItemId,
+                    reason);
+                Log.Debug(e, "Background health check known failure stack for {DavItemId}", davItemId);
+            }
+            else
+            {
+                Log.Error(
+                    e,
+                    "Unexpected error performing background health check for {DavItemId}: {Message}",
+                    davItemId,
+                    e.Message);
+            }
+        }
+        finally
+        {
+            _inProgress.TryRemove(davItemId, out _);
+        }
+    }
+
+    private async Task WaitForCoordinatorWakeAsync(CancellationToken ct)
+    {
+        var delay = Task.Delay(CoordinatorPollInterval, ct);
+        var workers = _inProgress.Values
+            .Select(worker => worker.ProcessingTask)
+            .Where(task => task is not null)
+            .Cast<Task>()
+            .ToArray();
+        if (workers.Length == 0)
+        {
+            await delay.ConfigureAwait(false);
+            return;
+        }
+
+        await Task.WhenAny([.. workers, delay]).ConfigureAwait(false);
+        ct.ThrowIfCancellationRequested();
+    }
+
+    private sealed class InProgressHealthCheck
+    {
+        public Task? ProcessingTask { get; set; }
     }
 
     public static IOrderedQueryable<DavItem> GetHealthCheckQueueItems(DavDatabaseClient dbClient)
@@ -522,6 +629,9 @@ public class HealthCheckService : BackgroundService
                 }
             }
 
+            if (!isUrgentRepair)
+                await WaitForQueueIdleBeforeRepairAsync(davItem, ct).ConfigureAwait(false);
+
             // when usenet article is missing, try PAR2 repair before Arr remove/re-grab
             if (_configManager.IsPar2RepairEnabled() && _configManager.IsPar2PreferredOverArr()
                 && await _par2RepairService.TryPar2RepairAsync(davItem, [e.SegmentId], ct).ConfigureAwait(false))
@@ -603,10 +713,15 @@ public class HealthCheckService : BackgroundService
             .OrderBy(index => index)
             .ToList();
         var holeSegmentIds = holeIndices.Select(index => segments[index]).ToArray();
+        var repairStarted = false;
 
         // PAR2 first, with the full hole list: reconstruct from parity before any verdict.
-        if (_configManager.IsPar2RepairEnabled() && _configManager.IsPar2PreferredOverArr()
-            && await _par2RepairService.TryPar2RepairAsync(davItem, holeSegmentIds, ct).ConfigureAwait(false))
+        if (_configManager.IsPar2RepairEnabled() && _configManager.IsPar2PreferredOverArr())
+        {
+            await WaitForQueueIdleBeforeRepairAsync(davItem, ct).ConfigureAwait(false);
+            repairStarted = true;
+            if (await _par2RepairService.TryPar2RepairAsync(davItem, holeSegmentIds, ct)
+                    .ConfigureAwait(false))
         {
             var utcNow = DateTimeOffset.UtcNow;
             davItem.LastHealthCheck = utcNow;
@@ -615,7 +730,8 @@ public class HealthCheckService : BackgroundService
             _arrNoMatchConfirmations.TryRemove(davItem.Id, out _);
             // The patched segments are served locally now; any earlier hole/corrupt record is obsolete.
             if (nzbFile.MissingSegmentIndices != null || nzbFile.CorruptSegmentIndices != null)
-                await SwapNzbFileBlobAsync(davItem, nzbFile, null, null, replaceCorruptRecord: true)
+                    await SwapNzbFileBlobAsync(
+                            davItem, nzbFile, null, null, replaceCorruptRecord: true)
                     .ConfigureAwait(false);
             await RecordHealthResult(
                 dbClient, davItem,
@@ -623,6 +739,7 @@ public class HealthCheckService : BackgroundService
                 HealthCheckResult.RepairAction.RepairedViaPar2,
                 "Missing segment(s) repaired from PAR2 parity.", ct).ConfigureAwait(false);
             return;
+        }
         }
 
         var (containerClass, probedClass, criticalHeadEndExclusive) = await ResolveContainerClassAsync(
@@ -655,6 +772,8 @@ public class HealthCheckService : BackgroundService
             // fails fast pre-import (issue #732), then take today's repair path.
             if (FilenameUtil.IsImportantFileType(davItem.Name))
                 AddMissingSegmentIds(holeSegmentIds);
+            if (!repairStarted)
+                await WaitForQueueIdleBeforeRepairAsync(davItem, ct).ConfigureAwait(false);
             await Repair(davItem, dbClient, ct).ConfigureAwait(false);
             return;
         }
@@ -722,6 +841,10 @@ public class HealthCheckService : BackgroundService
         // One bounded head read per file, ever: the probed class is persisted with the
         // hole record. Runs inside the caller's maintenance download context (attribution)
         // and cancellation scope; early disposal of the body stream is by design.
+        using var healthAdmissionScope = ct.SetContext(
+            new HealthCheckAdmissionContext(
+                _healthCheckConnectionGate,
+                HealthCheckAdmissionPriority.Background));
         var response = await _usenetClient.DecodedBodyAsync(segments[0], ct).ConfigureAwait(false);
         if (response.Stream is not { } headStream)
             throw new UsenetUnexpectedResponseException(segments[0], response.ResponseMessage);
@@ -799,6 +922,20 @@ public class HealthCheckService : BackgroundService
 
         return true;
     }
+
+    private async Task WaitForQueueIdleBeforeRepairAsync(DavItem davItem, CancellationToken ct)
+    {
+        if (!HasActiveQueueItems) return;
+
+        Log.Information(
+            "Health repair for {Path} is waiting for active queue work to finish.",
+            davItem.Path);
+        while (HasActiveQueueItems)
+            await Task.Delay(CoordinatorPollInterval, ct).ConfigureAwait(false);
+    }
+
+    private bool HasActiveQueueItems =>
+        HasActiveQueueItemsOverride?.Invoke() ?? _queueManager.HasActiveQueueItems;
 
     /// <summary>
     /// Persists the degraded-damage record by writing a NEW blob and swapping
