@@ -13,6 +13,7 @@ describe("calculateProviderConnectionBudget", () => {
         [15, 15, 0, 7, 7],
         [10, 4, 6, 2, 8],
         [10, 5, 5, 2, 7],
+        [1, 1, 0, 1, 1],
     ])(
         "derives metadata capacity for P=%i and T=%i",
         (providerLimit, transferLimit, base, burst, maximum) => {
