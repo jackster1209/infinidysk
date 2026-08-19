@@ -29,6 +29,7 @@ import { subscribeWebsocketTopics, useWebsocketTopic } from "~/utils/shared-webs
 import { isMaskedSecret } from "~/utils/config-mask";
 import { generateUuid } from "~/utils/uuid";
 import { shouldWarnCleartextCredentials } from "./cleartext-credentials";
+import { applyAutoTuneTransferRecommendation } from "./provider-autotune";
 import {
   DndContext,
   type DragEndEvent,
@@ -134,6 +135,7 @@ type ConnectionDetails = {
   User: string;
   Pass: string;
   MaxConnections: number;
+    MaxTransferConnections?: number | null;
   Priority?: number;
   PipeliningDepth?: number | null;
   // Optional user-set label. Shown in the UI in place of Host when present;
@@ -1331,6 +1333,9 @@ function ProviderModal({
   const [maxConnections, setMaxConnections] = useState(
     provider?.MaxConnections?.toString() || "20",
   );
+  const [maxTransferConnections, setMaxTransferConnections] = useState(
+    provider?.MaxTransferConnections?.toString() || "",
+  );
   const [pipeliningDepth, setPipeliningDepth] = useState(
     provider?.PipeliningDepth?.toString() || "",
   );
@@ -1353,7 +1358,7 @@ function ProviderModal({
   const [saveError, setSaveError] = useState<string | null>(null);
   const benchmarkAbortRef = useRef<AbortController | null>(null);
   const passIsMasked = isMaskedSecret(pass);
-  // Stable across parent re-parses of the same provider so Apply recommendation
+    // Stable across parent re-parses of the same provider so Apply transfer recommendation
   // (and other dirty-config updates) don't wipe in-progress form state.
   const providerIdentityKey = provider ? providerIdentity(provider) : "new";
 
@@ -1372,6 +1377,7 @@ function ProviderModal({
       setUser(provider?.User || "");
       setPass(provider?.Pass || "");
       setMaxConnections(provider?.MaxConnections?.toString() || "20");
+            setMaxTransferConnections(provider?.MaxTransferConnections?.toString() || "");
       setPipeliningDepth(provider?.PipeliningDepth?.toString() || "");
       setType(provider?.Type ?? ProviderType.Pooled);
       setLimitValue(lim.value);
@@ -1543,7 +1549,10 @@ function ProviderModal({
         formData.append("skip-tls-verification", skipTlsVerification.toString());
         formData.append("user", user);
         formData.append("pass", pass);
-        formData.append("max-connections", maxConnections || "10");
+        formData.append(
+          "max-connections",
+          (pipeliningOnly ? maxTransferConnections : maxConnections) || maxConnections || "10",
+        );
         formData.append("intensity", intensity);
         formData.append("pipelining-only", pipeliningOnly ? "true" : "false");
         if (dataBudget) formData.append("data-budget-mb", dataBudget);
@@ -1607,6 +1616,7 @@ function ProviderModal({
       user,
       pass,
       maxConnections,
+      maxTransferConnections,
       intensity,
       pipeliningOnly,
       dataBudget,
@@ -1615,16 +1625,21 @@ function ProviderModal({
 
   const handleApplyRecommendation = useCallback(() => {
     if (!benchmarkResult) return;
-    // In pipelining-only mode there's no connection recommendation, so this
-    // leaves Max Connections untouched and only applies pipelining.
-    if (benchmarkResult.recommendedConnections && benchmarkResult.recommendedConnections > 0) {
-      setMaxConnections(String(benchmarkResult.recommendedConnections));
-    }
+        const connectionLimits = applyAutoTuneTransferRecommendation(
+            {
+                providerConnectionLimit: maxConnections,
+                transferConnections: maxTransferConnections,
+            },
+            benchmarkResult.recommendedConnections,
+            benchmarkResult.pipeliningOnly,
+            benchmarkResult.verificationRun ?? false,
+        );
+        setMaxTransferConnections(connectionLimits.transferConnections);
     if (benchmarkResult.pipelining) {
       setPipeliningDepth(String(benchmarkResult.pipelining.recommendedDepth));
       onApplyPipelining(benchmarkResult.pipelining.recommendEnabled);
     }
-  }, [benchmarkResult, onApplyPipelining]);
+    }, [benchmarkResult, maxConnections, maxTransferConnections, onApplyPipelining]);
 
   const handleCancelBenchmark = useCallback(() => {
     benchmarkAbortRef.current?.abort();
@@ -1669,6 +1684,9 @@ function ProviderModal({
         User: user,
         Pass: pass,
         MaxConnections: parseInt(maxConnections, 10),
+                MaxTransferConnections: maxTransferConnections.trim() === ""
+                    ? null
+                    : parseInt(maxTransferConnections, 10),
         PipeliningDepth: pipeliningDepth.trim() === "" ? null : parseInt(pipeliningDepth, 10),
         Priority: provider?.Priority ?? 0,
         ...(provider?.ProviderId ? { ProviderId: provider.ProviderId } : {}),
@@ -1695,6 +1713,7 @@ function ProviderModal({
     user,
     pass,
     maxConnections,
+    maxTransferConnections,
     pipeliningDepth,
     nickname,
     storageGroup,
@@ -1711,16 +1730,27 @@ function ProviderModal({
     pipeliningDepth.trim() === "" ||
     (isPositiveInteger(pipeliningDepth) && Number(pipeliningDepth) <= 64);
 
+  const hasTransferLimit = maxTransferConnections.trim() !== "";
+  const transferLimitExceedsProvider =
+    hasTransferLimit &&
+    isPositiveInteger(maxTransferConnections) &&
+    isPositiveInteger(maxConnections) &&
+    Number(maxTransferConnections) > Number(maxConnections);
+  const isTransferLimitValid =
+    !hasTransferLimit ||
+    (isPositiveInteger(maxTransferConnections) && !transferLimitExceedsProvider);
+
   const isFormValid =
     host.trim() !== "" &&
     isPositiveInteger(port) &&
     user.trim() !== "" &&
     pass.trim() !== "" &&
     isPositiveInteger(maxConnections) &&
+    isTransferLimitValid &&
     isPipeliningDepthValid;
 
-  // The speed test doesn't need Max Connections (it can recommend one), just
-  // a reachable provider.
+  // The speed test only needs a reachable provider; the configured provider
+  // ceiling scopes any transfer recommendation it produces.
   const canBenchmark =
     host.trim() !== "" && isPositiveInteger(port) && user.trim() !== "" && pass.trim() !== "";
 
@@ -2026,6 +2056,13 @@ function ProviderModal({
             onCancel={handleCancelBenchmark}
             onApply={handleApplyRecommendation}
           />
+                    {transferLimitExceedsProvider && (
+                        <Alert variant="warning" className="alert-soft text-xs">
+                            The recommended Transfer Connections value ({maxTransferConnections}) exceeds
+                            the current Provider Connection Limit ({maxConnections}). Increase the provider
+                            limit or run Auto-tune again before saving.
+                        </Alert>
+                    )}
         </ProviderModalSection>
 
         <ProviderModalSection title="Data quota">
@@ -2192,6 +2229,7 @@ function BenchmarkPanel(props: BenchmarkPanelProps) {
       : 0;
   const canApply =
     !!result &&
+    !result.verificationRun &&
     result.throughputTested &&
     (recommended != null || (result.pipeliningOnly && !!pipe));
   const phaseIndex = progress
@@ -2206,11 +2244,11 @@ function BenchmarkPanel(props: BenchmarkPanelProps) {
     <div className="rounded-lg border border-base-content/10 bg-base-200/40 p-4">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div className="min-w-[180px] flex-1">
-          <div className="text-sm font-semibold text-base-content">Auto-tune connections</div>
+                    <div className="text-sm font-semibold text-base-content">Auto-tune transfer connections</div>
           <HelpText className="mt-0">
             {pipeliningOnly
-              ? "Keeps your Max Connections and just measures the best NNTP pipelining depth at that count."
-              : "Runs a real speed & latency test, then recommends the best connection count and pipelining settings. Speeds are megabytes/sec (MB/s), same as SABnzbd — not megabits (Mb/s). 1 Gb/s ≈ 125 MB/s max."}
+                            ? "Keeps your Transfer Connections and just measures the best NNTP pipelining depth at that count."
+                            : "Runs a real speed & latency test, then recommends Transfer Connections and pipelining settings without changing your Provider Connection Limit. Speeds are megabytes/sec (MB/s), same as SABnzbd — not megabits (Mb/s). 1 Gb/s ≈ 125 MB/s max."}
           </HelpText>
         </div>
         <div className="flex flex-wrap items-center gap-3">
@@ -2268,8 +2306,8 @@ function BenchmarkPanel(props: BenchmarkPanelProps) {
         className="mt-3 block"
         content={
           pipeliningOnly
-            ? "Won't change your connection count — tests pipelining depth at the Max Connections you've set. Run idle for the cleanest read."
-            : "When off, also sweeps connection counts. Prefer idle for the cleanest read."
+            ? "Won't change Transfer Connections — tests pipelining depth at that count, or at the Provider Connection Limit in legacy mode. Run idle for the cleanest read."
+            : "When off, also sweeps transfer connection counts. Prefer idle for the cleanest read."
         }
       >
         <Toggle
@@ -2280,7 +2318,7 @@ function BenchmarkPanel(props: BenchmarkPanelProps) {
           onChange={(e) => setPipeliningOnly(e.target.checked)}
           label={
             <span className="text-sm text-base-content">
-              Only tune pipelining (keep my Max Connections)
+              Only tune pipelining (keep my Transfer Connections)
             </span>
           }
         />
@@ -2469,7 +2507,7 @@ function BenchmarkPanel(props: BenchmarkPanelProps) {
           ) : result.throughputTested && recommended ? (
             <div className="stats stats-vertical mt-4 w-full max-w-full border border-base-content/10 bg-base-300 sm:stats-horizontal">
               <div className="stat min-w-0 py-3">
-                <div className="stat-title text-[10px] uppercase tracking-wide">Recommended</div>
+                                <div className="stat-title text-[10px] uppercase tracking-wide">Recommended Transfer Connections</div>
                 <div className="stat-value text-xl font-mono">{recommended}</div>
                 <div className="stat-desc font-mono tabular-nums">
                   connection{recommended === 1 ? "" : "s"}
@@ -2518,7 +2556,7 @@ function BenchmarkPanel(props: BenchmarkPanelProps) {
           ) : (
             <div className="mt-3.5 text-sm leading-relaxed text-base-content/80">
               Latency measured{result.latency ? ` — ${result.latency.avgMs} ms avg` : ""}. Download
-              something first to get a connection recommendation.
+              something first to get a transfer-connection recommendation.
             </div>
           )}
 
@@ -2554,7 +2592,7 @@ function BenchmarkPanel(props: BenchmarkPanelProps) {
             <div className="mt-3 text-sm leading-relaxed text-base-content/80">
               Pipelining wasn’t tested this run. Raise the data budget, or use{" "}
               <strong className="font-semibold text-base-content">Only tune pipelining</strong>{" "}
-              after applying the connection count.
+              after applying Transfer Connections.
             </div>
           )}
 
@@ -2582,7 +2620,7 @@ function BenchmarkPanel(props: BenchmarkPanelProps) {
                   ? "Applied — review & save"
                   : result.pipeliningOnly
                     ? "Apply pipelining"
-                    : "Apply recommendation"}
+                    : "Apply transfer recommendation"}
               </Button>
               {recommended != null && !result.verificationRun && (
                 <Button
