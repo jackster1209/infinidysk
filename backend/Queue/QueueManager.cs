@@ -37,6 +37,8 @@ public sealed class QueueManager : IQueueCoordinator, IDisposable
     private readonly WatchdogLog _watchdogLog;
     private readonly QueueItemSourceTracker _sourceTracker;
     private readonly BenchmarkGate _benchmarkGate;
+    private readonly HealthCheckConnectionGate _healthCheckConnectionGate;
+    private readonly bool _ownsHealthCheckConnectionGate;
 
     private CancellationTokenSource _sleepingQueueToken = new();
     private readonly Lock _sleepingQueueLock = new();
@@ -86,10 +88,12 @@ public sealed class QueueManager : IQueueCoordinator, IDisposable
         WatchdogLog watchdogLog,
         QueueItemSourceTracker sourceTracker,
         BenchmarkGate benchmarkGate,
+        HealthCheckConnectionGate healthCheckConnectionGate,
         IDbContextFactory<DavDatabaseContext> dbContextFactory
     ) : this(
         usenetClient, configManager, websocketManager, providerUsageTracker,
-        watchdogLog, sourceTracker, benchmarkGate, startLoop: false, dbContextFactory)
+        watchdogLog, sourceTracker, benchmarkGate, startLoop: false,
+        healthCheckConnectionGate, dbContextFactory)
     {
     }
 
@@ -102,6 +106,7 @@ public sealed class QueueManager : IQueueCoordinator, IDisposable
         QueueItemSourceTracker sourceTracker,
         BenchmarkGate benchmarkGate,
         bool startLoop,
+        HealthCheckConnectionGate? healthCheckConnectionGate = null,
         IDbContextFactory<DavDatabaseContext>? dbContextFactory = null
     )
     {
@@ -113,6 +118,9 @@ public sealed class QueueManager : IQueueCoordinator, IDisposable
         _sourceTracker = sourceTracker;
         _benchmarkGate = benchmarkGate;
         _dbContextFactory = dbContextFactory;
+        _healthCheckConnectionGate = healthCheckConnectionGate
+                                     ?? new HealthCheckConnectionGate(configManager);
+        _ownsHealthCheckConnectionGate = healthCheckConnectionGate is null;
         _cancellationTokenSource = CancellationTokenSource
             .CreateLinkedTokenSource(SigtermUtil.GetCancellationToken());
         if (startLoop)
@@ -978,7 +986,7 @@ public sealed class QueueManager : IQueueCoordinator, IDisposable
             queueItem, queueNzbStream, dbClient, cachingUsenetClient,
             _configManager, _websocketManager, _providerUsageTracker,
             _watchdogLog, _sourceTracker, progressHook, _retryAttempts,
-            _finalizeLock, cts.Token,
+            _finalizeLock, _healthCheckConnectionGate, cts.Token,
             stageReporter: stage =>
             {
                 inProgressQueueItem.CurrentStage = stage;
@@ -1362,6 +1370,7 @@ public sealed class QueueManager : IQueueCoordinator, IDisposable
         }
 
         _sleepingQueueToken.Dispose();
+        if (_ownsHealthCheckConnectionGate) _healthCheckConnectionGate.Dispose();
     }
 
     public readonly record struct InProgressQueueItemSnapshot(

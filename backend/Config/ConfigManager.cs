@@ -405,7 +405,6 @@ public class ConfigManager : IConfigReader, IConfigUpdater, IConfigChangeSource
                 case ConfigKeys.WatchtowerSeriesRecentCount:
                 case ConfigKeys.WatchtowerSeasonBundleFallbackRecentCount:
                 case ConfigKeys.WatchtowerSeasonBundleFallbackMaxEpisodes:
-                case ConfigKeys.RepairHealthcheckConcurrency:
                 case ConfigKeys.RepairAutoRemoveAfterFailures:
                 case ConfigKeys.DatabaseHistoryRetentionDays:
                 case ConfigKeys.DatabaseHealthcheckRetentionDays:
@@ -415,6 +414,14 @@ public class ConfigManager : IConfigReader, IConfigUpdater, IConfigChangeSource
                 case ConfigKeys.ApiNzbBackupRetentionDays:
                 case ConfigKeys.QueueSpeedLimitKbps:
                     RequireLong(item.ConfigName, value);
+                    break;
+
+                case ConfigKeys.RepairHealthcheckConcurrency:
+                    RequireLongInRange(item.ConfigName, value, 1, 200);
+                    break;
+
+                case ConfigKeys.RepairHealthcheckWorkers:
+                    RequireLongInRange(item.ConfigName, value, 1, 8);
                     break;
 
                 case ConfigKeys.ProwlarrSyncIntervalMinutes:
@@ -1877,17 +1884,36 @@ public class ConfigManager : IConfigReader, IConfigUpdater, IConfigChangeSource
     }
 
     /// <summary>
-    /// Max concurrent NNTP STAT connections for health checks.
-    /// Capped at the configured provider pool size to avoid pool starvation.
+    /// Maximum aggregate NNTP verification connections shared by background health
+    /// checks and queue article-existence validation.
     /// </summary>
     public int GetHealthCheckConcurrency()
     {
-        var poolSize = GetUsenetProviderConfig().TotalPooledConnections;
-        var configured = int.Parse(
-            StringUtil.EmptyToNull(GetConfigValue(ConfigKeys.RepairHealthcheckConcurrency))
-            ?? "50"
-        );
-        return Math.Clamp(configured, 1, Math.Max(1, poolSize));
+        var configured = StringUtil.EmptyToNull(GetConfigValue(ConfigKeys.RepairHealthcheckConcurrency));
+        return int.TryParse(configured, out var value) ? Math.Clamp(value, 1, 200) : 50;
+    }
+
+    /// <summary>
+    /// Maximum number of library files that may be health-checked concurrently.
+    /// Each worker shares the aggregate health connection limit above.
+    /// </summary>
+    public int GetHealthCheckWorkers()
+    {
+        var configured = StringUtil.EmptyToNull(GetConfigValue(ConfigKeys.RepairHealthcheckWorkers));
+        return int.TryParse(configured, out var value) ? Math.Clamp(value, 1, 8) : 1;
+    }
+
+    /// <summary>
+    /// Routine background verification may coexist with queue processing only when
+    /// every enabled provider explicitly uses split Transfer/Metadata scheduling.
+    /// </summary>
+    public bool CanBackgroundHealthCoexistWithQueue()
+    {
+        var enabledProviders = GetUsenetProviderConfig().Providers
+            .Where(provider => provider.Type != ProviderType.Disabled)
+            .ToList();
+        return enabledProviders.Count > 0
+               && enabledProviders.All(provider => provider.MaxTransferConnections.HasValue);
     }
 
     /// <summary>
