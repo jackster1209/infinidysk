@@ -71,6 +71,7 @@ public class HealthCheckService : BackgroundService
     private readonly Par2RepairService _par2RepairService;
     private readonly RepairPatchStore _repairPatchStore;
     private readonly IDbContextFactory<DavDatabaseContext>? _dbContextFactory;
+    private readonly HealthCheckConnectionGate _healthCheckConnectionGate;
 
     private static readonly HashSet<string> _missingSegmentIds = [];
     private static readonly Queue<string> _missingSegmentOrder = [];
@@ -87,6 +88,7 @@ public class HealthCheckService : BackgroundService
         QueueManager queueManager,
         Par2RepairService par2RepairService,
         RepairPatchStore repairPatchStore,
+        HealthCheckConnectionGate healthCheckConnectionGate,
         IDbContextFactory<DavDatabaseContext>? dbContextFactory = null
     )
     {
@@ -99,6 +101,7 @@ public class HealthCheckService : BackgroundService
         _par2RepairService = par2RepairService;
         _repairPatchStore = repairPatchStore;
         _dbContextFactory = dbContextFactory;
+        _healthCheckConnectionGate = healthCheckConnectionGate;
 
         _configManager.OnConfigChanged += (_, configEventArgs) =>
         {
@@ -386,6 +389,10 @@ public class HealthCheckService : BackgroundService
             List<int>? confirmedHoles = null;
             using (statCts = ContextualCancellationTokenSource.CreateLinkedTokenSource(ct))
             {
+                using var healthAdmissionScope = statCts.Token.SetContext(
+                    new HealthCheckAdmissionContext(
+                        _healthCheckConnectionGate,
+                        HealthCheckAdmissionPriority.Background));
                 statCts.CancelAfter(HealthCheckProgressTimeout);
                 var progress = progressHook.ToPercentage(statSegments.Count);
                 if (!canClassify)

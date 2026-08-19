@@ -40,6 +40,7 @@ public class QueueItemProcessor(
     IProgress<int> progress,
     ConcurrentDictionary<Guid, int> retryAttempts,
     SemaphoreSlim? finalizeLock,
+    HealthCheckConnectionGate? healthCheckConnectionGate,
     CancellationToken ct,
     Action<string>? stageReporter = null
 )
@@ -67,7 +68,8 @@ public class QueueItemProcessor(
             progress,
             new ConcurrentDictionary<Guid, int>(),
             finalizeLock: null,
-            ct)
+            healthCheckConnectionGate: null,
+            ct: ct)
     {
     }
 
@@ -478,6 +480,11 @@ public class QueueItemProcessor(
             var healthCheckConcurrency = Math.Min(
                 configManager.GetHealthCheckConcurrency(),
                 QueueFanOut.GetConcurrency(configManager, ct));
+            using var healthAdmissionScope = healthCheckConnectionGate is null
+                ? null
+                : ct.SetContext(new HealthCheckAdmissionContext(
+                    healthCheckConnectionGate,
+                    HealthCheckAdmissionPriority.Queue));
             await RunStageAsync(
                     "health",
                     () => ArticleExistenceChecker

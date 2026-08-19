@@ -9,6 +9,7 @@ using NzbWebDAV.Clients.Usenet.Models;
 using NzbWebDAV.Exceptions;
 using NzbWebDAV.Extensions;
 using NzbWebDAV.Models;
+using NzbWebDAV.Services;
 using NzbWebDAV.Services.Metrics;
 using NzbWebDAV.Services.StreamTrace;
 using Serilog;
@@ -865,8 +866,16 @@ public class MultiConnectionNntpClient(
         var started = Stopwatch.GetTimestamp();
         ConnectionLock<INntpClient> connectionLock;
         ProviderConnectionAdmission.Lease? admissionLease = null;
+        HealthCheckConnectionGate.Lease? healthCheckLease = null;
         try
         {
+            if (ct.GetContext<HealthCheckAdmissionContext>() is { } healthCheckContext)
+            {
+                healthCheckLease = await healthCheckContext.Gate
+                    .AcquireAsync(healthCheckContext.Priority, ct)
+                    .ConfigureAwait(false);
+            }
+
             if (_connectionAdmission is not null)
             {
                 admissionLease = await _connectionAdmission.AcquireAsync(
@@ -876,10 +885,17 @@ public class MultiConnectionNntpClient(
 
             connectionLock = await connectionPool.GetConnectionLockAsync(priority, ct)
                 .ConfigureAwait(false);
-            if (admissionLease is not null)
+            if (admissionLease is not null || healthCheckLease is not null)
             {
-                connectionLock.AttachDisposeCallback(admissionLease.Dispose);
+                var attachedAdmissionLease = admissionLease;
+                var attachedHealthCheckLease = healthCheckLease;
+                connectionLock.AttachDisposeCallback(() =>
+                {
+                    try { attachedAdmissionLease?.Dispose(); }
+                    finally { attachedHealthCheckLease?.Dispose(); }
+                });
                 admissionLease = null;
+                healthCheckLease = null;
             }
         }
         catch (Exception e) when (IsRetiredPoolAcquisitionFailure(e) && e is not OutOfMemoryException)
@@ -889,6 +905,7 @@ public class MultiConnectionNntpClient(
         finally
         {
             admissionLease?.Dispose();
+            healthCheckLease?.Dispose();
         }
         var elapsed = Stopwatch.GetElapsedTime(started);
         latencyTracker?.Record(MetricsKey, LatencyPhase.PoolWait, workload, operation, elapsed);
