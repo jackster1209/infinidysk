@@ -12,7 +12,8 @@ Background health monitoring and replacement of unhealthy library items.
 | Control | Config key | Default | Effect |
 |---------|------------|---------|--------|
 | Enable Background Repairs | `repair.enable` | off | Needs library dir + *Arr |
-| Health Check Concurrency [since 0.9.0](https://github.com/infinidysk/infinidysk/releases/tag/v0.9.0){ .nzbdav-since } | `repair.healthcheck-concurrency` | `50` | Worker ceiling for concurrent STAT checks; capped by the provider pool. Actual contention with playback is governed by provider-pool admission and **Streaming Priority** |
+| Maximum Health Check Connections [since 0.9.0](https://github.com/infinidysk/infinidysk/releases/tag/v0.9.0){ .nzbdav-since } | `repair.healthcheck-concurrency` | `50` | Aggregate NNTP verification-connection limit shared by background checks and queue article validation (1–200). Provider capacity and Transfer/Metadata admission may lower actual use |
+| Concurrent Health Checks | `repair.healthcheck-workers` | `1` | Library files checked at once (1–8). All workers share the aggregate connection limit above; this setting never multiplies it |
 | Health Check Depth | `repair.healthcheck-depth` | `standard` | standard / enhanced / deep / complete |
 | Check older releases less thoroughly [since 0.8.0](https://github.com/infinidysk/infinidysk/releases/tag/v0.8.0){ .nzbdav-since } | `repair.healthcheck-aging` | off | Aging taper |
 | Repair After Streaming Failures | `repair.auto-remove-after-failures` | `0` | Consecutive streaming failures before urgent repair; `0` = immediate repair |
