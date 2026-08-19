@@ -162,6 +162,58 @@ public class ProviderConnectionAdmissionTests
         using var lowLease = await low.WaitAsync(TestTimeout);
     }
 
+    [Fact]
+    public async Task SnapshotReportsDerivedLimitsAndLiveOperationCounts()
+    {
+        using var admission = CreateAdmission(providerLimit: 5, transferLimit: 2);
+        using var transfer1 = await AcquireTransfer(admission);
+        using var metadata1 = await AcquireMetadata(admission);
+        using var metadata2 = await AcquireMetadata(admission);
+        using var metadata3 = await AcquireMetadata(admission);
+        using var metadata4 = await AcquireMetadata(admission);
+        var waitingTransfer = AcquireTransfer(admission);
+        var waitingMetadata = AcquireMetadata(admission);
+
+        var snapshot = admission.GetSnapshot();
+
+        Assert.Equal(2, snapshot.ConfiguredTransferLimit);
+        Assert.Equal(2, snapshot.EffectiveTransferLimit);
+        Assert.Equal(3, snapshot.BaseMetadataCapacity);
+        Assert.Equal(1, snapshot.MetadataBurstAllowance);
+        Assert.Equal(4, snapshot.MaxMetadataCapacity);
+        Assert.Equal(1, snapshot.ActiveTransferOperations);
+        Assert.Equal(4, snapshot.ActiveMetadataOperations);
+        Assert.Equal(1, snapshot.WaitingTransferOperations);
+        Assert.Equal(1, snapshot.WaitingMetadataOperations);
+
+        metadata1.Dispose();
+        using var transfer2 = await waitingTransfer.WaitAsync(TestTimeout);
+        metadata2.Dispose();
+        using var replacementMetadata = await waitingMetadata.WaitAsync(TestTimeout);
+    }
+
+    [Fact]
+    public void SnapshotUsesCurrentEffectiveProviderLimitWithoutChangingConfiguredTransferLimit()
+    {
+        var providerLimit = 43;
+        using var admission = new ProviderConnectionAdmission(
+            () => Volatile.Read(ref providerLimit),
+            configuredTransferLimit: 20);
+
+        var initial = admission.GetSnapshot();
+        Volatile.Write(ref providerLimit, 15);
+        var reduced = admission.GetSnapshot();
+
+        Assert.Equal(20, initial.ConfiguredTransferLimit);
+        Assert.Equal(20, initial.EffectiveTransferLimit);
+        Assert.Equal(23, initial.BaseMetadataCapacity);
+        Assert.Equal(33, initial.MaxMetadataCapacity);
+        Assert.Equal(20, reduced.ConfiguredTransferLimit);
+        Assert.Equal(15, reduced.EffectiveTransferLimit);
+        Assert.Equal(0, reduced.BaseMetadataCapacity);
+        Assert.Equal(7, reduced.MaxMetadataCapacity);
+    }
+
     private static readonly TimeSpan TestTimeout = TimeSpan.FromSeconds(5);
 
     private static ProviderConnectionAdmission CreateAdmission(
