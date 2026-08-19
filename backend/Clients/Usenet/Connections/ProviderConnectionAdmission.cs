@@ -97,6 +97,26 @@ internal sealed class ProviderConnectionAdmission : IDisposable
         }
     }
 
+    public ProviderConnectionAdmissionSnapshot GetSnapshot()
+    {
+        lock (_lock)
+        {
+            var budget = ProviderConnectionBudget.Calculate(
+                _getEffectiveProviderLimit(),
+                _configuredTransferLimit);
+            return new ProviderConnectionAdmissionSnapshot(
+                _configuredTransferLimit,
+                budget.EffectiveTransferLimit,
+                budget.BaseMetadataCapacity,
+                budget.MetadataBurstAllowance,
+                budget.MaxMetadataCapacity,
+                _activeTransfers,
+                _activeMetadata,
+                _transferHighWaiters.Count + _transferLowWaiters.Count,
+                _metadataHighWaiters.Count + _metadataLowWaiters.Count);
+        }
+    }
+
     private bool CanEnterImmediately(ProviderConnectionKind kind)
     {
         if (HasWaiters(kind)) return false;
