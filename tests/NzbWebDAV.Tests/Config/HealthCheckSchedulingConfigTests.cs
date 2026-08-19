@@ -1,3 +1,4 @@
+using System.Collections;
 using System.Text.Json;
 using NzbWebDAV.Config;
 using NzbWebDAV.Database.Models;
@@ -57,6 +58,22 @@ public sealed class HealthCheckSchedulingConfigTests
     public void CanBackgroundHealthCoexistWithQueue_RejectsEmptyConfiguration()
     {
         Assert.False(new ConfigManager().CanBackgroundHealthCoexistWithQueue());
+    }
+
+    [Fact]
+    public void HeadlessOverlay_MapsHealthCheckWorkers()
+    {
+        var config = new ConfigManager();
+        config.ApplyEnvironmentOverlay(ConfigEnvironmentOverlay.LoadFromEnvironment(new Hashtable
+        {
+            ["NZBDAV_CONFIG__REPAIR__HEALTHCHECK_WORKERS"] = "3",
+        }));
+
+        Assert.Equal(3, config.GetHealthCheckWorkers());
+        Assert.True(config.IsEnvironmentManaged(ConfigKeys.RepairHealthcheckWorkers));
+        Assert.Equal(
+            "NZBDAV_CONFIG__REPAIR__HEALTHCHECK_WORKERS",
+            config.GetEnvironmentVariableName(ConfigKeys.RepairHealthcheckWorkers));
     }
 
     [Theory]

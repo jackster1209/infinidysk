@@ -538,10 +538,11 @@ public class QueueItemProcessor(
             var healthCheckConcurrency = Math.Min(
                 configManager.GetHealthCheckConcurrency(),
                 QueueFanOut.GetConcurrency(configManager, ct));
-            using var healthAdmissionScope = healthCheckConnectionGate is null
-                ? null
-                : ct.SetContext(new HealthCheckAdmissionContext(
-                    healthCheckConnectionGate,
+            using var fallbackHealthCheckGate = healthCheckConnectionGate is null
+                ? new HealthCheckConnectionGate(configManager)
+                : null;
+            using var healthAdmissionScope = ct.SetContext(new HealthCheckAdmissionContext(
+                healthCheckConnectionGate ?? fallbackHealthCheckGate!,
                     HealthCheckAdmissionPriority.Queue));
             await RunStageAsync(
                     "health",
