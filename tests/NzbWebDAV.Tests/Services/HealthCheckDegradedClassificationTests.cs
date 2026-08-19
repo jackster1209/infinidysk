@@ -287,6 +287,36 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task RoutineMissingArticle_WaitsForQueueIdleBeforeStartingRepair()
+    {
+        var segments = NewSegmentIds(HealthCheckService.SampleFloor + 1000);
+        var sizes = Enumerable.Repeat(100L, segments.Length).ToArray();
+        var (item, _) = await AddVideoFileAsync("movie.mkv", segments, sizes);
+        var fake = NewFakeClient(segments, missing: [50]);
+        var (service, par2) = await NewServiceAsync(fake, par2Outcome: false);
+        var queueActive = true;
+        service.CoordinatorPollInterval = TimeSpan.FromMilliseconds(10);
+        service.HasActiveQueueItemsOverride = () => queueActive;
+
+        var healthCheck = service.PerformHealthCheck(
+            item,
+            _dbClient,
+            concurrency: 4,
+            CancellationToken.None);
+        await Task.Delay(100);
+
+        Assert.False(healthCheck.IsCompleted);
+        Assert.Empty(par2.Requests);
+
+        queueActive = false;
+        await healthCheck.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.Single(par2.Requests);
+        Assert.Equal(
+            HealthCheckResult.HealthResult.Unhealthy,
+            Assert.Single(GetHealthRows(item.Id)).Result);
+    }
+
+    [Fact]
     public async Task ToleranceDisabled_UsesLegacyPath()
     {
         _configManager.UpdateValues(

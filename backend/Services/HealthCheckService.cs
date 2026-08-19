@@ -246,18 +246,20 @@ public class HealthCheckService : BackgroundService
 
     private async Task RunHealthCheckWorkerAsync(Guid davItemId, CancellationToken ct)
     {
+        using var workerCts = ContextualCancellationTokenSource.CreateLinkedTokenSource(ct);
+        var workerToken = workerCts.Token;
         try
         {
             if (ProcessCandidateOverride is { } processCandidate)
             {
-                await processCandidate(davItemId, ct).ConfigureAwait(false);
+                await processCandidate(davItemId, workerToken).ConfigureAwait(false);
                 return;
             }
 
             await using var dbContext = CreateDbContext();
             var dbClient = new DavDatabaseClient(dbContext);
             var davItem = await dbContext.Items
-                .SingleOrDefaultAsync(item => item.Id == davItemId, ct)
+                .SingleOrDefaultAsync(item => item.Id == davItemId, workerToken)
                 .ConfigureAwait(false);
             if (davItem is null) return;
 
@@ -265,7 +267,7 @@ public class HealthCheckService : BackgroundService
                     davItem,
                     dbClient,
                     _configManager.GetHealthCheckConcurrency(),
-                    ct)
+                    workerToken)
                 .ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
