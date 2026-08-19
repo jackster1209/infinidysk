@@ -17,3 +17,18 @@ export function completeHealthCheck(state: HealthQueueState, davItemId: string):
         : state.uncheckedCount,
   };
 }
+
+export function updateHealthCheckProgress(
+    state: HealthQueueState,
+    davItemId: string,
+    progress: number,
+): HealthQueueState {
+    if (!state.items.some(item => item.id === davItemId)) return state;
+
+    return {
+        ...state,
+        items: state.items.map(item => item.id === davItemId
+            ? { ...item, progress }
+            : item),
+    };
+}
