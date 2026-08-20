@@ -848,7 +848,13 @@ public class MultiConnectionNntpClient(
 
     private static SemaphorePriority GetDownloadPriority(CancellationToken ct)
     {
-        return ct.GetContext<DownloadPriorityContext>()?.Priority ?? SemaphorePriority.Low;
+        if (ct.GetContext<DownloadPriorityContext>() is { } downloadPriority)
+            return downloadPriority.Priority;
+
+        return ct.GetContext<HealthCheckAdmissionContext>()?.Priority
+            == HealthCheckAdmissionPriority.Queue
+                ? SemaphorePriority.High
+                : SemaphorePriority.Low;
     }
 
     /// <summary>

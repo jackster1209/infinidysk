@@ -250,7 +250,7 @@ public sealed class HealthCheckCoordinatorTests
                 repairPatchStore: _patchStore);
             _gate = new HealthCheckConnectionGate(Config);
             var benchmarkGate = new BenchmarkGate();
-            _queueManager = new QueueManager(
+            _queueManager = QueueManager.CreateForTests(
                 _usenet,
                 Config,
                 websocketManager,

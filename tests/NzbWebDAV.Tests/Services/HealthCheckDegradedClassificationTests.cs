@@ -92,7 +92,7 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
             new ProviderBytesTracker(),
             new StreamTraceBuffer(100),
             new ActiveReadRegistry());
-        _queueManager = new QueueManager(
+        _queueManager = QueueManager.CreateForTests(
             _usenet,
             _configManager,
             websocketManager,

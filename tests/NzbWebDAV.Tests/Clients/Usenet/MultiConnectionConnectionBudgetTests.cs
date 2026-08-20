@@ -29,11 +29,12 @@ public class MultiConnectionConnectionBudgetTests
         var state = new BlockingStatState();
         using var firstProvider = CreateClient(state, maxTransferConnections: null);
         using var secondProvider = CreateClient(state, maxTransferConnections: null);
-        using var healthContext = CancellationToken.None.SetContext(
+        using var cts = new CancellationTokenSource();
+        using var healthContext = cts.Token.SetContext(
             new HealthCheckAdmissionContext(gate, HealthCheckAdmissionPriority.Background));
 
-        var requests = StartStats(firstProvider, 2)
-            .Concat(StartStats(secondProvider, 2))
+        var requests = StartStats(firstProvider, 2, cts.Token)
+            .Concat(StartStats(secondProvider, 2, cts.Token))
             .ToArray();
         await WaitForEnteredCount(state, expected: 1);
 
@@ -113,11 +114,12 @@ public class MultiConnectionConnectionBudgetTests
 
     private static Task<UsenetStatResponse>[] StartStats(
         MultiConnectionNntpClient client,
-        int count) =>
+        int count,
+        CancellationToken ct = default) =>
         Enumerable.Range(0, count)
             .Select(i => client.StatAsync(
                 new SegmentId($"segment-{i}"),
-                CancellationToken.None))
+                ct))
             .ToArray();
 
     private static async Task WaitForEnteredCount(BlockingStatState state, int expected)

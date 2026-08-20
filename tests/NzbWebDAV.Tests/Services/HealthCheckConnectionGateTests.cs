@@ -1,7 +1,9 @@
+using System.Text.Json;
 using NzbWebDAV.Clients.Usenet.Contexts;
 using NzbWebDAV.Config;
 using NzbWebDAV.Database.Models;
 using NzbWebDAV.Extensions;
+using NzbWebDAV.Models;
 using NzbWebDAV.Services;
 
 namespace NzbWebDAV.Tests.Services;
@@ -124,9 +126,93 @@ public sealed class HealthCheckConnectionGateTests
         Assert.Equal(0, gate.GetSnapshot().WaitingBackground);
     }
 
+    [Fact]
+    public async Task AcquireAsync_WithAlreadyCancelledToken_DoesNotQueueWaiter()
+    {
+        var config = CreateConfig(1);
+        using var gate = new HealthCheckConnectionGate(config);
+        using var cts = new CancellationTokenSource();
+        await cts.CancelAsync();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => gate.AcquireAsync(HealthCheckAdmissionPriority.Background, cts.Token));
+
+        Assert.Equal(0, gate.GetSnapshot().Active);
+        Assert.Equal(0, gate.GetSnapshot().WaitingBackground);
+    }
+
+    [Fact]
+    public async Task Dispose_FaultsPendingWaiters()
+    {
+        var config = CreateConfig(1);
+        var gate = new HealthCheckConnectionGate(config);
+        using var active = await gate.AcquireAsync(
+            HealthCheckAdmissionPriority.Background, CancellationToken.None);
+        var waiting = gate.AcquireAsync(
+            HealthCheckAdmissionPriority.Background, CancellationToken.None);
+
+        gate.Dispose();
+
+        await Assert.ThrowsAsync<ObjectDisposedException>(() => waiting);
+    }
+
+    [Fact]
+    public async Task ParallelAcquireRelease_NeverExceedsConfiguredLimit()
+    {
+        const int limit = 4;
+        var config = CreateConfig(limit);
+        using var gate = new HealthCheckConnectionGate(config);
+        var maximumObserved = 0;
+        var tasks = Enumerable.Range(0, 64).Select(async _ =>
+        {
+            using var lease = await gate.AcquireAsync(
+                HealthCheckAdmissionPriority.Background, CancellationToken.None);
+            var active = gate.GetSnapshot().Active;
+            var observed = Volatile.Read(ref maximumObserved);
+            while (active > observed)
+            {
+                var previous = Interlocked.CompareExchange(
+                    ref maximumObserved,
+                    active,
+                    observed);
+                if (previous == observed) break;
+                observed = previous;
+            }
+            await Task.Yield();
+        });
+
+        await Task.WhenAll(tasks);
+
+        Assert.InRange(maximumObserved, 1, limit);
+        Assert.Equal(0, gate.GetSnapshot().Active);
+    }
+
     private static ConfigManager CreateConfig(int limit)
     {
         var config = new ConfigManager();
+        config.UpdateValues([
+            new ConfigItem
+            {
+                ConfigName = ConfigKeys.UsenetProviders,
+                ConfigValue = JsonSerializer.Serialize(new UsenetProviderConfig
+                {
+                    Providers =
+                    [
+                        new UsenetProviderConfig.ConnectionDetails
+                        {
+                            ProviderId = Guid.NewGuid(),
+                            Type = ProviderType.Pooled,
+                            Host = "gate.example",
+                            Port = 563,
+                            UseSsl = true,
+                            User = "user",
+                            Pass = "pass",
+                            MaxConnections = 200,
+                        },
+                    ],
+                }),
+            },
+        ]);
         SetLimit(config, limit);
         return config;
     }
