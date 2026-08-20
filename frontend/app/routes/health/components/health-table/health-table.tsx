@@ -121,7 +121,7 @@ function VerificationLoad({ snapshot }: { snapshot: HealthCheckGateSnapshot }) {
         : 0;
 
     return (
-        <div className="grid gap-4 border-b border-base-content/10 bg-base-200/30 px-4 py-3 md:grid-cols-[minmax(220px,1fr)_auto_auto_auto] md:items-center md:px-6">
+        <div className="grid gap-4 border-b border-base-content/10 bg-base-200/30 px-4 py-3 md:grid-cols-[minmax(220px,1fr)_auto_auto] md:items-center md:px-6">
             <div className="min-w-0">
                 <div className="mb-1.5 flex items-center justify-between gap-3 text-xs">
                     <span className="inline-flex items-center gap-1.5 font-semibold text-base-content/70">
@@ -139,16 +139,14 @@ function VerificationLoad({ snapshot }: { snapshot: HealthCheckGateSnapshot }) {
                     max={100}
                 />
             </div>
-            <LoadValue label="Recent active peak" value={`${snapshot.peakActive} / ${snapshot.limit}`} />
             <LoadValue
-                label="Fair scheduler"
+                label="Health Scheduler"
                 value={`${snapshot.scheduler.activeAssignments} active`}
                 detail={`${snapshot.scheduler.runnableSessions} runnable · ${snapshot.scheduler.pendingSegments.toLocaleString()} pending`}
             />
             <LoadValue
                 label="Background waiting"
                 value={snapshot.waitingBackground.toLocaleString()}
-                detail={`Recent peak ${snapshot.peakWaitingBackground.toLocaleString()}`}
             />
         </div>
     );

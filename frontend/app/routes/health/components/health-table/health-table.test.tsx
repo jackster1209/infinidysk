@@ -49,10 +49,9 @@ describe("HealthTable", () => {
 
         expect(markup).toContain("Verification load");
         expect(markup).toContain("18 / 50 active");
-        expect(markup).toContain("42 / 50");
         expect(markup).toContain("1,234");
-        expect(markup).toContain("Recent peak 1,600");
-        expect(markup).toContain("Fair scheduler");
+        expect(markup).not.toContain("Recent peak");
+        expect(markup).toContain("Health Scheduler");
         expect(markup).toContain("3 runnable · 12,345 pending");
         expect(markup).toContain("7 active STAT · 125 / 1,000 complete");
         expect(markup).toContain("value=\"36\"");
