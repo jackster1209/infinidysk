@@ -298,6 +298,9 @@ public class HealthCheckService : BackgroundService
                 .ConfigureAwait(false);
             if (davItem is null) return;
 
+            // Give each worker the full local fan-out deliberately. The process-wide gate is
+            // authoritative; slicing this value by worker count would strand capacity whenever
+            // fewer workers have runnable verification operations.
             await PerformHealthCheck(
                     davItem,
                     dbClient,

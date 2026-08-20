@@ -2,6 +2,7 @@ using System.Text;
 using NzbWebDAV.Clients.Usenet.Connections;
 using NzbWebDAV.Clients.Usenet.Models;
 using NzbWebDAV.Models;
+using NzbWebDAV.Services;
 using NzbWebDAV.Services.Observability;
 using Prometheus;
 
@@ -103,6 +104,31 @@ public sealed class PrometheusMetricsTests
         Assert.DoesNotContain("state=\"metadata_active\"", exposition);
         Assert.DoesNotContain("limit=\"transfer_configured\"", exposition);
         Assert.DoesNotContain("limit=\"learned\"", exposition);
+    }
+
+    [Fact]
+    public async Task HealthCheckGateMetricsExposeCurrentAndWindowPeakState()
+    {
+        var registry = new CollectorRegistry();
+        var metrics = new PrometheusMetrics(registry);
+
+        metrics.SetHealthCheckGate(new HealthCheckConnectionGateSnapshot(
+            Limit: 50,
+            Active: 40,
+            WaitingQueue: 2,
+            WaitingBackground: 75,
+            PeakActive: 50,
+            PeakWaitingQueue: 4,
+            PeakWaitingBackground: 120));
+        var exposition = await ExportAsync(registry);
+
+        Assert.Contains("nzbdav_health_check_gate_limit 50", exposition);
+        Assert.Contains("nzbdav_health_check_gate_active 40", exposition);
+        Assert.Contains("nzbdav_health_check_gate_peak_active 50", exposition);
+        Assert.Contains("nzbdav_health_check_gate_waiting{priority=\"queue\"} 2", exposition);
+        Assert.Contains("nzbdav_health_check_gate_waiting{priority=\"background\"} 75", exposition);
+        Assert.Contains("nzbdav_health_check_gate_peak_waiting{priority=\"queue\"} 4", exposition);
+        Assert.Contains("nzbdav_health_check_gate_peak_waiting{priority=\"background\"} 120", exposition);
     }
 
     private static async Task<string> ExportAsync(CollectorRegistry registry)

@@ -187,6 +187,36 @@ public sealed class HealthCheckConnectionGateTests
         Assert.Equal(0, gate.GetSnapshot().Active);
     }
 
+    [Fact]
+    public async Task MetricsSnapshot_ReportsWindowPeaksAndResetsToCurrentState()
+    {
+        var config = CreateConfig(1);
+        using var gate = new HealthCheckConnectionGate(config);
+        using var active = await gate.AcquireAsync(
+            HealthCheckAdmissionPriority.Background, CancellationToken.None);
+        var background = gate.AcquireAsync(
+            HealthCheckAdmissionPriority.Background, CancellationToken.None);
+        var queue = gate.AcquireAsync(
+            HealthCheckAdmissionPriority.Queue, CancellationToken.None);
+
+        var first = gate.TakeMetricsSnapshot();
+        Assert.Equal(1, first.PeakActive);
+        Assert.Equal(1, first.PeakWaitingQueue);
+        Assert.Equal(1, first.PeakWaitingBackground);
+
+        active.Dispose();
+        using var queueLease = await queue.WaitAsync(TimeSpan.FromSeconds(1));
+        var second = gate.TakeMetricsSnapshot();
+        Assert.Equal(1, second.PeakActive);
+        Assert.Equal(1, second.PeakWaitingBackground);
+
+        queueLease.Dispose();
+        using var backgroundLease = await background.WaitAsync(TimeSpan.FromSeconds(1));
+        var third = gate.TakeMetricsSnapshot();
+        Assert.Equal(0, third.PeakWaitingQueue);
+        Assert.Equal(1, third.PeakWaitingBackground);
+    }
+
     private static ConfigManager CreateConfig(int limit)
     {
         var config = new ConfigManager();

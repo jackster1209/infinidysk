@@ -12,7 +12,10 @@ public sealed record HealthCheckConnectionGateSnapshot(
     int Limit,
     int Active,
     int WaitingQueue,
-    int WaitingBackground);
+    int WaitingBackground,
+    int PeakActive,
+    int PeakWaitingQueue,
+    int PeakWaitingBackground);
 
 /// <summary>
 /// Process-wide admission gate for NNTP work that verifies article existence.
@@ -25,6 +28,9 @@ public sealed class HealthCheckConnectionGate : IDisposable
     private readonly LinkedList<Waiter> _queueWaiters = [];
     private readonly LinkedList<Waiter> _backgroundWaiters = [];
     private int _active;
+    private int _peakActive;
+    private int _peakWaitingQueue;
+    private int _peakWaitingBackground;
     private bool _disposed;
 
     public HealthCheckConnectionGate(ConfigManager configManager)
@@ -46,11 +52,13 @@ public sealed class HealthCheckConnectionGate : IDisposable
             if (CanEnterImmediately(priority))
             {
                 _active++;
+                _peakActive = Math.Max(_peakActive, _active);
                 return Task.FromResult(new Lease(this));
             }
 
             var waiter = new Waiter(priority);
             GetQueue(priority).AddLast(waiter);
+            RecordWaiterPeak(priority);
             if (cancellationToken.CanBeCanceled)
             {
                 var registration = cancellationToken.Register(
@@ -71,13 +79,30 @@ public sealed class HealthCheckConnectionGate : IDisposable
     {
         lock (_lock)
         {
-            return new HealthCheckConnectionGateSnapshot(
-                GetLimit(),
-                _active,
-                _queueWaiters.Count,
-                _backgroundWaiters.Count);
+            return CreateSnapshot();
         }
     }
+
+    internal HealthCheckConnectionGateSnapshot TakeMetricsSnapshot()
+    {
+        lock (_lock)
+        {
+            var snapshot = CreateSnapshot();
+            _peakActive = _active;
+            _peakWaitingQueue = _queueWaiters.Count;
+            _peakWaitingBackground = _backgroundWaiters.Count;
+            return snapshot;
+        }
+    }
+
+    private HealthCheckConnectionGateSnapshot CreateSnapshot() => new(
+        GetLimit(),
+        _active,
+        _queueWaiters.Count,
+        _backgroundWaiters.Count,
+        _peakActive,
+        _peakWaitingQueue,
+        _peakWaitingBackground);
 
     private int GetLimit() => _configManager.GetHealthCheckConcurrency();
 
@@ -136,10 +161,19 @@ public sealed class HealthCheckConnectionGate : IDisposable
             var waiter = TakeFirst(_queueWaiters) ?? TakeFirst(_backgroundWaiters);
             if (waiter is null) break;
             _active++;
+            _peakActive = Math.Max(_peakActive, _active);
             ready.Add((waiter.Completion, new Lease(this)));
         }
 
         return ready;
+    }
+
+    private void RecordWaiterPeak(HealthCheckAdmissionPriority priority)
+    {
+        if (priority == HealthCheckAdmissionPriority.Queue)
+            _peakWaitingQueue = Math.Max(_peakWaitingQueue, _queueWaiters.Count);
+        else
+            _peakWaitingBackground = Math.Max(_peakWaitingBackground, _backgroundWaiters.Count);
     }
 
     private LinkedList<Waiter> GetQueue(HealthCheckAdmissionPriority priority) => priority switch
