@@ -77,8 +77,6 @@ public sealed class HealthCheckSchedulingConfigTests
     }
 
     [Theory]
-    [InlineData(ConfigKeys.RepairHealthcheckConcurrency, "0")]
-    [InlineData(ConfigKeys.RepairHealthcheckConcurrency, "201")]
     [InlineData(ConfigKeys.RepairHealthcheckWorkers, "0")]
     [InlineData(ConfigKeys.RepairHealthcheckWorkers, "9")]
     public void ValidateConfigItems_RejectsSchedulingValuesOutsideRange(string key, string value)
@@ -86,6 +84,47 @@ public sealed class HealthCheckSchedulingConfigTests
         Assert.Throws<ArgumentException>(() => ConfigManager.ValidateConfigItems([
             new ConfigItem { ConfigName = key, ConfigValue = value },
         ]));
+    }
+
+    [Theory]
+    [InlineData("0", 1)]
+    [InlineData("300", 10)]
+    [InlineData("9223372036854775807", 10)]
+    [InlineData("-50", 1)]
+    public void GetHealthCheckConcurrency_AcceptsLegacyValuesAndClampsToPool(
+        string configured,
+        int expected)
+    {
+        var config = CreateProviderConfig(MakeProvider(ProviderType.Pooled, 8));
+        ConfigManager.ValidateConfigItems([
+            new ConfigItem
+            {
+                ConfigName = ConfigKeys.RepairHealthcheckConcurrency,
+                ConfigValue = configured,
+            },
+        ]);
+        config.UpdateValues([
+            new ConfigItem
+            {
+                ConfigName = ConfigKeys.RepairHealthcheckConcurrency,
+                ConfigValue = configured,
+            },
+        ]);
+
+        Assert.Equal(expected, config.GetHealthCheckConcurrency());
+    }
+
+    [Fact]
+    public void HeadlessOverlay_AcceptsLegacyHealthCheckConcurrencyValue()
+    {
+        var config = CreateProviderConfig(MakeProvider(ProviderType.Pooled, 8));
+        config.ApplyEnvironmentOverlay(ConfigEnvironmentOverlay.LoadFromEnvironment(new Hashtable
+        {
+            ["NZBDAV_CONFIG__REPAIR__HEALTHCHECK_CONCURRENCY"] = "300",
+        }));
+
+        Assert.Equal(10, config.GetHealthCheckConcurrency());
+        Assert.True(config.IsEnvironmentManaged(ConfigKeys.RepairHealthcheckConcurrency));
     }
 
     private static ConfigManager CreateProviderConfig(

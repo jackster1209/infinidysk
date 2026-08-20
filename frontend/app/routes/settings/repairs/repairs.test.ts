@@ -49,6 +49,14 @@ describe("Repairs settings helpers", () => {
         expect(isRepairsSettingsValid({
             ...baseConfig,
             "repair.healthcheck-concurrency": "201",
+        })).toBe(true);
+        expect(isRepairsSettingsValid({
+            ...baseConfig,
+            "repair.healthcheck-concurrency": "0",
+        })).toBe(true);
+        expect(isRepairsSettingsValid({
+            ...baseConfig,
+            "repair.healthcheck-concurrency": "not-a-number",
         })).toBe(false);
         expect(isRepairsSettingsValid({
             ...baseConfig,

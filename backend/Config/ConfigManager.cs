@@ -417,7 +417,10 @@ public class ConfigManager : IConfigReader, IConfigUpdater, IConfigChangeSource
                     break;
 
                 case ConfigKeys.RepairHealthcheckConcurrency:
-                    RequireLongInRange(item.ConfigName, value, 1, 200);
+                    // Keep accepting values persisted by earlier releases. The getter
+                    // applies the current safe runtime bounds without making upgrades
+                    // fail configuration validation.
+                    RequireLong(item.ConfigName, value);
                     break;
 
                 case ConfigKeys.RepairHealthcheckWorkers:
@@ -1889,8 +1892,11 @@ public class ConfigManager : IConfigReader, IConfigUpdater, IConfigChangeSource
     /// </summary>
     public int GetHealthCheckConcurrency()
     {
+        var poolSize = Math.Max(1, GetUsenetProviderConfig().TotalPooledConnections);
+        var maximum = Math.Min(200, poolSize);
         var configured = StringUtil.EmptyToNull(GetConfigValue(ConfigKeys.RepairHealthcheckConcurrency));
-        return int.TryParse(configured, out var value) ? Math.Clamp(value, 1, 200) : 50;
+        var value = long.TryParse(configured, out var parsed) ? parsed : 50;
+        return (int)Math.Clamp(value, 1L, maximum);
     }
 
     /// <summary>
