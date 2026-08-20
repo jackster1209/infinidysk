@@ -1,8 +1,14 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { loader } from "./route";
 
-const { getConfigMock, getHealthCheckHistoryMock, getHealthCheckQueueMock } = vi.hoisted(() => ({
+const {
+  getConfigMock,
+  getHealthCheckGateMock,
+  getHealthCheckHistoryMock,
+  getHealthCheckQueueMock,
+} = vi.hoisted(() => ({
   getConfigMock: vi.fn(),
+  getHealthCheckGateMock: vi.fn(),
   getHealthCheckHistoryMock: vi.fn(),
   getHealthCheckQueueMock: vi.fn(),
 }));
@@ -10,6 +16,7 @@ const { getConfigMock, getHealthCheckHistoryMock, getHealthCheckQueueMock } = vi
 vi.mock("~/clients/backend-client.server", () => ({
   backendClient: {
     getConfig: getConfigMock,
+    getHealthCheckGate: getHealthCheckGateMock,
     getHealthCheckHistory: getHealthCheckHistoryMock,
     getHealthCheckQueue: getHealthCheckQueueMock,
   },
@@ -101,11 +108,13 @@ describe("health route loader", () => {
       items: historyItems,
       totalCount: 1,
     });
+    getHealthCheckGateMock.mockResolvedValueOnce(verificationLoad);
     getConfigMock.mockResolvedValueOnce([{ configName: "repair.enable", configValue: "TRUE" }]);
 
     await expect(loader(loaderArgs())).resolves.toEqual({
       uncheckedCount: 12,
       queueItems,
+      verificationLoad,
       historyStats,
       historyItems,
       historyTotalCount: 1,
@@ -115,6 +124,7 @@ describe("health route loader", () => {
       isEnabled: true,
     });
     expect(getHealthCheckQueueMock).toHaveBeenCalledWith(30);
+    expect(getHealthCheckGateMock).toHaveBeenCalledOnce();
     expect(getHealthCheckHistoryMock).toHaveBeenCalledWith({
       page: 1,
       pageSize: 25,

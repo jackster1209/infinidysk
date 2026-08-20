@@ -214,6 +214,23 @@ public class ProviderConnectionAdmissionTests
         Assert.Equal(7, reduced.MaxMetadataCapacity);
     }
 
+    [Fact]
+    public async Task ChangeCallbackTracksActiveOperationLifecycle()
+    {
+        var snapshots = new List<ProviderConnectionAdmissionSnapshot>();
+        using var admission = new ProviderConnectionAdmission(
+            () => 5,
+            configuredTransferLimit: 2,
+            onChanged: snapshots.Add);
+
+        var transfer = await AcquireTransfer(admission);
+        Assert.Equal(1, Assert.Single(snapshots).ActiveTransferOperations);
+
+        transfer.Dispose();
+        Assert.Equal(0, snapshots[^1].ActiveTransferOperations);
+        Assert.Equal(2, snapshots.Count);
+    }
+
     private static readonly TimeSpan TestTimeout = TimeSpan.FromSeconds(5);
 
     private static ProviderConnectionAdmission CreateAdmission(

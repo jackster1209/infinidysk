@@ -47,7 +47,8 @@ public class MultiConnectionNntpClient(
     string? metricsKey = null,
     ProviderLatencyTracker? latencyTracker = null,
     int? maxTransferConnections = null,
-    SemaphorePriorityOdds? priorityOdds = null
+    SemaphorePriorityOdds? priorityOdds = null,
+    Action<ProviderConnectionAdmissionSnapshot>? onConnectionAdmissionChanged = null
 ) : NntpClient
 {
     private readonly ProviderConnectionAdmission? _connectionAdmission =
@@ -55,7 +56,8 @@ public class MultiConnectionNntpClient(
             ? new ProviderConnectionAdmission(
                 () => connectionPool.EffectiveMaxConnections,
                 transferLimit,
-                priorityOdds)
+                priorityOdds,
+                onConnectionAdmissionChanged)
             : null;
 
     public ProviderType ProviderType { get; } = type;

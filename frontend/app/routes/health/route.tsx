@@ -11,12 +11,16 @@ import { useRevalidator, useSearchParams } from "react-router";
 import { useWebsocketTopics } from "~/utils/shared-websocket";
 import { Alert, Icon } from "~/components/ui";
 import type {
+  HealthCheckGateSnapshot,
   HealthCheckQueueResponse,
   HealthResult,
   RepairAction,
 } from "~/clients/backend-client.server";
 import {
   completeHealthCheck,
+  getVisibleHealthCheckItems,
+  parseHealthItemProgressMessage,
+  parseHealthItemStatusMessage,
   type HealthQueueState,
   updateHealthCheckProgress,
 } from "./health-queue-state";
@@ -33,6 +37,7 @@ const topicSubscriptions = {
 
 const PAGE_SIZE_OPTIONS = [25, 50, 100, 250] as const;
 const DEFAULT_PAGE_SIZE = 25;
+const VERIFICATION_LOAD_REFRESH_MS = 5_000;
 
 function parsePage(value: string | null): number {
   const page = parseInt(value ?? "1", 10);
@@ -63,8 +68,9 @@ export async function loader({ request }: Route.LoaderArgs) {
         ? undefined
         : historyFilter;
   const result = historyFilter === "degraded" ? "degraded" : undefined;
-  const [queueData, historyData, config] = await Promise.all([
+  const [queueData, verificationLoad, historyData, config] = await Promise.all([
     backendClient.getHealthCheckQueue(30),
+    backendClient.getHealthCheckGate(),
     backendClient.getHealthCheckHistory({
       page: historyPage,
       pageSize: historyPageSize,
@@ -77,6 +83,7 @@ export async function loader({ request }: Route.LoaderArgs) {
   return {
     uncheckedCount: queueData.uncheckedCount,
     queueItems: queueData.items,
+    verificationLoad,
     historyStats: historyData.stats,
     historyItems: historyData.items,
     historyTotalCount: historyData.totalCount,
@@ -99,6 +106,7 @@ export default function Health({ loaderData }: Route.ComponentProps) {
     items: loaderData.queueItems,
     uncheckedCount: loaderData.uncheckedCount,
   });
+  const [verificationLoad, setVerificationLoad] = useState(loaderData.verificationLoad);
   const { items: queueItems, uncheckedCount } = queueState;
   const [, setSearchParams] = useSearchParams();
   const revalidator = useRevalidator();
@@ -112,6 +120,9 @@ export default function Health({ loaderData }: Route.ComponentProps) {
   useEffect(() => {
     setHistoryTotalCount(loaderData.historyTotalCount);
   }, [loaderData.historyTotalCount]);
+  useEffect(() => {
+    setVerificationLoad(loaderData.verificationLoad);
+  }, [loaderData.verificationLoad]);
   useEffect(() => {
     setQueueState({
       items: loaderData.queueItems,
@@ -169,15 +180,41 @@ export default function Health({ loaderData }: Route.ComponentProps) {
     void refetchData(); // fire-and-forget queue refill
   }, [queueItems, setQueueState]);
 
+  useEffect(() => {
+    if (!isEnabled) return;
+    const controller = new AbortController();
+    const refreshVerificationLoad = async () => {
+      try {
+        const response = await fetch(withUrlBase("/api/get-health-check-gate"), {
+          signal: controller.signal,
+        });
+        if (response.ok) {
+          setVerificationLoad((await response.json()) as HealthCheckGateSnapshot);
+        }
+      } catch {
+        // Preserve the last snapshot across a transient refresh failure.
+      }
+    };
+    const interval = window.setInterval(
+      () => void refreshVerificationLoad(),
+      VERIFICATION_LOAD_REFRESH_MS,
+    );
+    return () => {
+      window.clearInterval(interval);
+      controller.abort();
+    };
+  }, [isEnabled]);
+
   // events
   const onHealthItemStatus = useCallback(
     (message: string) => {
-      const [davItemId, healthResult, repairAction] = message.split("|");
-      setQueueState((x) => completeHealthCheck(x, davItemId!));
+      const status = parseHealthItemStatusMessage(message);
+      if (!status) return;
+      setQueueState((x) => completeHealthCheck(x, status.davItemId));
       setHistoryStats((x) => {
         // 'hs' websocket payload carries numeric HealthResult / RepairAction enum values
-        const healthResultNum: HealthResult = Number(healthResult);
-        const repairActionNum: RepairAction = Number(repairAction);
+        const healthResultNum: HealthResult = status.healthResult;
+        const repairActionNum: RepairAction = status.repairAction;
 
         // attempt to find and update a matching statistic
         let updated = false;
@@ -210,10 +247,10 @@ export default function Health({ loaderData }: Route.ComponentProps) {
 
   const onHealthItemProgress = useCallback(
     (message: string) => {
-      const [davItemId, progress] = message.split("|");
-      if (progress === "done") return;
+      const progressUpdate = parseHealthItemProgressMessage(message);
+      if (!progressUpdate) return;
       setQueueState((queueState) =>
-        updateHealthCheckProgress(queueState, davItemId!, Number(progress)),
+        updateHealthCheckProgress(queueState, progressUpdate.davItemId, progressUpdate.progress),
       );
     },
     [setQueueState],
@@ -245,6 +282,11 @@ export default function Health({ loaderData }: Route.ComponentProps) {
           </div>
         </Alert>
       )}
+      <HealthTable
+        isEnabled={isEnabled}
+        healthCheckItems={getVisibleHealthCheckItems(queueItems)}
+        verificationLoad={verificationLoad}
+      />
       <HealthHistoryTable
         items={historyItems}
         totalCount={historyTotalCount}
@@ -257,10 +299,6 @@ export default function Health({ loaderData }: Route.ComponentProps) {
         onPageSelected={(page) => setHistoryParams({ page })}
         onPageSizeSelected={onHistoryPageSizeSelected}
         onRefresh={() => void revalidator.revalidate()}
-      />
-      <HealthTable
-        isEnabled={isEnabled}
-        healthCheckItems={queueItems.filter((_, index) => index < 10)}
       />
     </div>
   );
