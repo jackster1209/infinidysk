@@ -286,6 +286,11 @@ export default function Health({ loaderData }: Route.ComponentProps) {
           </div>
         </Alert>
       )}
+      <HealthTable
+        isEnabled={isEnabled}
+        healthCheckItems={getVisibleHealthCheckItems(queueItems)}
+        verificationLoad={verificationLoad}
+      />
       <HealthHistoryTable
         items={historyItems}
         totalCount={historyTotalCount}
@@ -298,11 +303,6 @@ export default function Health({ loaderData }: Route.ComponentProps) {
         onPageSelected={(page) => setHistoryParams({ page })}
         onPageSizeSelected={onHistoryPageSizeSelected}
         onRefresh={() => void revalidator.revalidate()}
-      />
-      <HealthTable
-        isEnabled={isEnabled}
-        healthCheckItems={getVisibleHealthCheckItems(queueItems)}
-        verificationLoad={verificationLoad}
       />
     </div>
   );
