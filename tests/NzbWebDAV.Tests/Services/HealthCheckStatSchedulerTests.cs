@@ -179,9 +179,10 @@ public sealed class HealthCheckStatSchedulerTests
         await using var harness = await SchedulerHarness.CreateAsync(limit: 5);
         var session = harness.StartSession(segmentCount: 100_000);
 
-        await WaitUntilAsync(() => session.Executor.InvocationCount == 5);
+        await WaitUntilAsync(() => harness.Scheduler.GetSnapshot().ActiveAssignments == 5);
 
         Assert.Equal(5, harness.Scheduler.GetSnapshot().ActiveAssignments);
+        Assert.Equal(5, session.Executor.InvocationCount);
         Assert.Equal(0, harness.Scheduler.GetSnapshot().PendingAdmissions);
         await session.CancelAsync();
     }
