@@ -43,6 +43,7 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
     private UsenetStreamingClient _usenet = null!;
     private QueueManager _queueManager = null!;
     private HealthCheckConnectionGate _healthCheckConnectionGate = null!;
+    private HealthCheckStatScheduler _healthCheckStatScheduler = null!;
 
     public async Task InitializeAsync()
     {
@@ -80,6 +81,10 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
 
         _failureTracker = new StreamingFailureTracker();
         _healthCheckConnectionGate = new HealthCheckConnectionGate(_configManager);
+        _healthCheckStatScheduler = new HealthCheckStatScheduler(
+            _configManager,
+            _healthCheckConnectionGate);
+        await _healthCheckStatScheduler.StartAsync(CancellationToken.None);
         _patchStore = new RepairPatchStore(Path.Join(_configRoot, "patches"), 1024 * 1024);
         await _patchStore.CatalogLoadTask;
 
@@ -107,6 +112,8 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
     public async Task DisposeAsync()
     {
         _queueManager.Dispose();
+        await _healthCheckStatScheduler.StopAsync(CancellationToken.None);
+        _healthCheckStatScheduler.Dispose();
         _healthCheckConnectionGate.Dispose();
         _usenet.Dispose();
         await _context.DisposeAsync();
@@ -124,7 +131,7 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         _failureTracker.RecordFailure(item.Id);
         var (service, par2) = await NewServiceAsync(fake, par2Outcome: false);
 
-        await service.PerformHealthCheck(item, _dbClient, concurrency: 4, CancellationToken.None);
+        await service.PerformHealthCheck(item, _dbClient, CancellationToken.None);
 
         // Degraded row, no repair
         var row = Assert.Single(GetHealthRows(item.Id));
@@ -164,7 +171,7 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         var fake = NewFakeClient(segments, missing: [2]);
         var (service, _) = await NewServiceAsync(fake, par2Outcome: false);
 
-        await service.PerformHealthCheck(item, _dbClient, concurrency: 4, CancellationToken.None);
+        await service.PerformHealthCheck(item, _dbClient, CancellationToken.None);
 
         var row = Assert.Single(GetHealthRows(item.Id));
         Assert.Equal(HealthCheckResult.HealthResult.Degraded, row.Result);
@@ -181,7 +188,7 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         var fake = NewFakeClient(segments, missing: [2, 3, 4]);
         var (service, _) = await NewServiceAsync(fake, par2Outcome: false);
 
-        await service.PerformHealthCheck(item, _dbClient, concurrency: 4, CancellationToken.None);
+        await service.PerformHealthCheck(item, _dbClient, CancellationToken.None);
 
         var row = Assert.Single(GetHealthRows(item.Id));
         Assert.Equal(HealthCheckResult.HealthResult.Unhealthy, row.Result);
@@ -202,7 +209,7 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         var fake = NewFakeClient(segments, missing: [0]);
         var (service, _) = await NewServiceAsync(fake, par2Outcome: false);
 
-        await service.PerformHealthCheck(item, _dbClient, concurrency: 4, CancellationToken.None);
+        await service.PerformHealthCheck(item, _dbClient, CancellationToken.None);
 
         var row = Assert.Single(GetHealthRows(item.Id));
         Assert.Equal(HealthCheckResult.HealthResult.Unhealthy, row.Result);
@@ -226,7 +233,7 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         _failureTracker.RecordFailure(item.Id);
         var (service, _) = await NewServiceAsync(fake, par2Outcome: false);
 
-        await service.PerformHealthCheck(item, _dbClient, concurrency: 4, CancellationToken.None);
+        await service.PerformHealthCheck(item, _dbClient, CancellationToken.None);
 
         var row = Assert.Single(GetHealthRows(item.Id));
         Assert.Equal(HealthCheckResult.HealthResult.Healthy, row.Result);
@@ -248,7 +255,7 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         _failureTracker.RecordFailure(item.Id);
         var (service, par2) = await NewServiceAsync(fake, par2Outcome: true);
 
-        await service.PerformHealthCheck(item, _dbClient, concurrency: 4, CancellationToken.None);
+        await service.PerformHealthCheck(item, _dbClient, CancellationToken.None);
 
         var row = Assert.Single(GetHealthRows(item.Id));
         Assert.Equal(HealthCheckResult.HealthResult.Healthy, row.Result);
@@ -274,7 +281,7 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         var fake = NewFakeClient(segments, missing: [50]);
         var (service, par2) = await NewServiceAsync(fake, par2Outcome: false);
 
-        await service.PerformHealthCheck(item, _dbClient, concurrency: 4, CancellationToken.None);
+        await service.PerformHealthCheck(item, _dbClient, CancellationToken.None);
 
         // Legacy path: single-segment PAR2 attempt, then repair; no hole record written.
         var row = Assert.Single(GetHealthRows(item.Id));
@@ -306,7 +313,6 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         var healthCheck = service.PerformHealthCheck(
             item,
             _dbClient,
-            concurrency: 4,
             CancellationToken.None);
         await waitEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
 
@@ -338,7 +344,6 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         await service.PerformHealthCheck(
             item,
             _dbClient,
-            concurrency: 4,
             CancellationToken.None);
 
         Assert.Empty(par2.Requests);
@@ -365,7 +370,6 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         await service.PerformHealthCheck(
             item,
             _dbClient,
-            concurrency: 4,
             CancellationToken.None);
 
         Assert.Empty(fake.StatRequestCounts);
@@ -392,7 +396,6 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         await service.PerformHealthCheck(
             item,
             _dbClient,
-            concurrency: 4,
             CancellationToken.None);
 
         Assert.Empty(par2.Requests);
@@ -424,7 +427,6 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         var healthCheck = service.PerformHealthCheck(
             item,
             _dbClient,
-            concurrency: 4,
             CancellationToken.None);
         await repairStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
 
@@ -452,7 +454,7 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         var fake = NewFakeClient(segments, missing: [2]);
         var (service, _) = await NewServiceAsync(fake, par2Outcome: false);
 
-        await service.PerformHealthCheck(item, _dbClient, concurrency: 4, CancellationToken.None);
+        await service.PerformHealthCheck(item, _dbClient, CancellationToken.None);
 
         var row = Assert.Single(GetHealthRows(item.Id));
         Assert.Equal(HealthCheckResult.HealthResult.Unhealthy, row.Result);
@@ -472,7 +474,7 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         var fake = NewFakeClient(segments, missing: [2]);
         var (service, _) = await NewServiceAsync(fake, par2Outcome: false);
 
-        await service.PerformHealthCheck(item, _dbClient, concurrency: 4, CancellationToken.None);
+        await service.PerformHealthCheck(item, _dbClient, CancellationToken.None);
 
         var row = Assert.Single(GetHealthRows(item.Id));
         Assert.Equal(HealthCheckResult.HealthResult.Unhealthy, row.Result);
@@ -490,7 +492,7 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         var fake = NewFakeClient(segments, missing: [2]);
         var (service, _) = await NewServiceAsync(fake, par2Outcome: false);
 
-        await service.PerformHealthCheck(item, _dbClient, concurrency: 4, CancellationToken.None);
+        await service.PerformHealthCheck(item, _dbClient, CancellationToken.None);
 
         var row = Assert.Single(GetHealthRows(item.Id));
         Assert.Equal(HealthCheckResult.HealthResult.Unhealthy, row.Result);
@@ -507,7 +509,7 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         fake.Serve(segments[0], Mp4Head(Box("ftyp", 16), Box("mdat", 100)));
         var (service, _) = await NewServiceAsync(fake, par2Outcome: false);
 
-        await service.PerformHealthCheck(item, _dbClient, concurrency: 4, CancellationToken.None);
+        await service.PerformHealthCheck(item, _dbClient, CancellationToken.None);
 
         var row = Assert.Single(GetHealthRows(item.Id));
         Assert.Equal(HealthCheckResult.HealthResult.Unhealthy, row.Result);
@@ -533,7 +535,7 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         fake.Serve(segments[0], Mp4Head(Box("ftyp", 16), Box("moov", 24), Box("mdat", 100)));
         var (service, _) = await NewServiceAsync(fake, par2Outcome: false);
 
-        await service.PerformHealthCheck(item, _dbClient, concurrency: 4, CancellationToken.None);
+        await service.PerformHealthCheck(item, _dbClient, CancellationToken.None);
 
         var row = Assert.Single(GetHealthRows(item.Id));
         Assert.Equal(HealthCheckResult.HealthResult.Degraded, row.Result);
@@ -548,7 +550,7 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
 
         // Second check with identical holes: persisted class is reused (no second BODY)
         // and the unchanged record is not rewritten.
-        await service.PerformHealthCheck(item, _dbClient, concurrency: 4, CancellationToken.None);
+        await service.PerformHealthCheck(item, _dbClient, CancellationToken.None);
 
         Assert.Equal(2, GetHealthRows(item.Id).Count);
         Assert.Equal(1, fake.BodyRequestCounts.GetValueOrDefault(segments[0]));
@@ -569,7 +571,7 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         fake.Serve(segments[0], Mp4Head(Box("ftyp", 16), BoxHeader("moov", 15_000)));
         var (service, _) = await NewServiceAsync(fake, par2Outcome: false);
 
-        await service.PerformHealthCheck(item, _dbClient, concurrency: 4, CancellationToken.None);
+        await service.PerformHealthCheck(item, _dbClient, CancellationToken.None);
 
         var row = Assert.Single(GetHealthRows(item.Id));
         Assert.Equal(HealthCheckResult.HealthResult.Unhealthy, row.Result);
@@ -584,7 +586,7 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         Assert.Throws<UsenetArticleNotFoundException>(
             () => HealthCheckService.CheckCachedMissingSegmentIds([segments[1]]));
 
-        await service.PerformHealthCheck(item, _dbClient, concurrency: 4, CancellationToken.None);
+        await service.PerformHealthCheck(item, _dbClient, CancellationToken.None);
 
         Assert.Equal(2, GetHealthRows(item.Id).Count);
         Assert.All(
@@ -603,13 +605,13 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         fake.Serve(segments[0], Mp4Head(Box("ftyp", 16), Box("moov", 24), Box("mdat", 100)));
         var (service, _) = await NewServiceAsync(fake, par2Outcome: false);
 
-        await service.PerformHealthCheck(item, _dbClient, concurrency: 4, CancellationToken.None);
+        await service.PerformHealthCheck(item, _dbClient, CancellationToken.None);
         var afterFirst = ReloadItem(item.Id);
         Assert.Equal(HealthCheckResult.HealthResult.Degraded, Assert.Single(GetHealthRows(item.Id)).Result);
 
         // Provider-side restoration: the segment is back on the next sweep.
         fake.Serve(segments[4], new byte[50]);
-        await service.PerformHealthCheck(item, _dbClient, concurrency: 4, CancellationToken.None);
+        await service.PerformHealthCheck(item, _dbClient, CancellationToken.None);
 
         var rows = GetHealthRows(item.Id);
         Assert.Equal(2, rows.Count);
@@ -635,7 +637,7 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         var fake = NewFakeClient(segments, missing: [2]);
         var (service, _) = await NewServiceAsync(fake, par2Outcome: false);
 
-        await service.PerformHealthCheck(item, _dbClient, concurrency: 4, CancellationToken.None);
+        await service.PerformHealthCheck(item, _dbClient, CancellationToken.None);
 
         // The patched segment is never STATed, yet the check still classifies
         // (full coverage is measured on the sampled list, not the STAT list).
@@ -657,7 +659,7 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         var fake = NewFakeClient(segments, missing: [], corrupt: [2]);
         var (service, par2) = await NewServiceAsync(fake, par2Outcome: false);
 
-        await service.PerformHealthCheck(item, _dbClient, concurrency: 4, CancellationToken.None);
+        await service.PerformHealthCheck(item, _dbClient, CancellationToken.None);
 
         var row = Assert.Single(GetHealthRows(item.Id));
         Assert.Equal(HealthCheckResult.HealthResult.Degraded, row.Result);
@@ -679,7 +681,7 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         var fake = NewFakeClient(segments, missing: [], corrupt: corrupt);
         var (service, _) = await NewServiceAsync(fake, par2Outcome: false);
 
-        await service.PerformHealthCheck(item, _dbClient, concurrency: 4, CancellationToken.None);
+        await service.PerformHealthCheck(item, _dbClient, CancellationToken.None);
 
         var row = Assert.Single(GetHealthRows(item.Id));
         Assert.Equal(HealthCheckResult.HealthResult.Unhealthy, row.Result);
@@ -696,7 +698,7 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         var fake = NewFakeClient(segments, missing: [], corrupt: [0]);
         var (service, _) = await NewServiceAsync(fake, par2Outcome: false);
 
-        await service.PerformHealthCheck(item, _dbClient, concurrency: 4, CancellationToken.None);
+        await service.PerformHealthCheck(item, _dbClient, CancellationToken.None);
 
         var row = Assert.Single(GetHealthRows(item.Id));
         Assert.Equal(HealthCheckResult.HealthResult.Unhealthy, row.Result);
@@ -712,7 +714,7 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         var fake = NewFakeClient(segments, missing: [2], corrupt: [4]);
         var (service, par2) = await NewServiceAsync(fake, par2Outcome: false);
 
-        await service.PerformHealthCheck(item, _dbClient, concurrency: 4, CancellationToken.None);
+        await service.PerformHealthCheck(item, _dbClient, CancellationToken.None);
 
         var row = Assert.Single(GetHealthRows(item.Id));
         Assert.Equal(HealthCheckResult.HealthResult.Degraded, row.Result);
@@ -733,7 +735,7 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         var fake = NewFakeClient(segments, missing: []);
         var (service, par2) = await NewServiceAsync(fake, par2Outcome: false);
 
-        await service.PerformHealthCheck(item, _dbClient, concurrency: 4, CancellationToken.None);
+        await service.PerformHealthCheck(item, _dbClient, CancellationToken.None);
 
         var row = Assert.Single(GetHealthRows(item.Id));
         Assert.Equal(HealthCheckResult.HealthResult.Healthy, row.Result);
@@ -753,7 +755,7 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         var fake = NewFakeClient(segments, missing: []);
         var (service, par2) = await NewServiceAsync(fake, par2Outcome: false);
 
-        await service.PerformHealthCheck(item, _dbClient, concurrency: 4, CancellationToken.None);
+        await service.PerformHealthCheck(item, _dbClient, CancellationToken.None);
 
         var row = Assert.Single(GetHealthRows(item.Id));
         Assert.Equal(HealthCheckResult.HealthResult.Healthy, row.Result);
@@ -774,7 +776,7 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         fake.ForcedResponseSegmentId = "wrong@example.com";
         var (service, par2) = await NewServiceAsync(fake, par2Outcome: false);
 
-        await service.PerformHealthCheck(item, _dbClient, concurrency: 4, CancellationToken.None);
+        await service.PerformHealthCheck(item, _dbClient, CancellationToken.None);
 
         var row = Assert.Single(GetHealthRows(item.Id));
         Assert.Equal(HealthCheckResult.HealthResult.Degraded, row.Result);
@@ -793,7 +795,7 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         var fake = NewFakeClient(segments, missing: []);
         var (service, _) = await NewServiceAsync(fake, par2Outcome: false);
 
-        await service.PerformHealthCheck(item, _dbClient, concurrency: 4, CancellationToken.None);
+        await service.PerformHealthCheck(item, _dbClient, CancellationToken.None);
 
         var row = Assert.Single(GetHealthRows(item.Id));
         Assert.Equal(HealthCheckResult.HealthResult.Healthy, row.Result);
@@ -857,7 +859,8 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
             _queueManager,
             par2,
             _patchStore,
-            _healthCheckConnectionGate);
+            _healthCheckConnectionGate,
+            _healthCheckStatScheduler);
         return (service, par2);
     }
 

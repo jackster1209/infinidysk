@@ -72,6 +72,7 @@ public class HealthCheckService : BackgroundService
     private readonly RepairPatchStore _repairPatchStore;
     private readonly IDbContextFactory<DavDatabaseContext>? _dbContextFactory;
     private readonly HealthCheckConnectionGate _healthCheckConnectionGate;
+    private readonly HealthCheckStatScheduler _healthCheckStatScheduler;
     private readonly ConcurrentDictionary<Guid, InProgressHealthCheck> _inProgress = new();
 
     private static readonly HashSet<string> _missingSegmentIds = [];
@@ -90,7 +91,8 @@ public class HealthCheckService : BackgroundService
     internal Func<bool>? HasActiveQueueItemsOverride { get; set; }
     internal IReadOnlyCollection<Guid> InProgressHealthCheckIds => _inProgress.Keys.ToArray();
 
-    private DavDatabaseContext CreateDbContext() => DavDatabaseContexts.Create(CreateDbContextOverride);
+    private DavDatabaseContext CreateDbContext() =>
+        DavDatabaseContexts.Create(CreateDbContextOverride, _dbContextFactory);
 
     public HealthCheckService
     (
@@ -103,6 +105,7 @@ public class HealthCheckService : BackgroundService
         Par2RepairService par2RepairService,
         RepairPatchStore repairPatchStore,
         HealthCheckConnectionGate healthCheckConnectionGate,
+        HealthCheckStatScheduler healthCheckStatScheduler,
         IDbContextFactory<DavDatabaseContext>? dbContextFactory = null
     )
     {
@@ -116,6 +119,7 @@ public class HealthCheckService : BackgroundService
         _repairPatchStore = repairPatchStore;
         _dbContextFactory = dbContextFactory;
         _healthCheckConnectionGate = healthCheckConnectionGate;
+        _healthCheckStatScheduler = healthCheckStatScheduler;
 
         _configManager.OnConfigChanged += (_, configEventArgs) =>
         {
@@ -298,13 +302,9 @@ public class HealthCheckService : BackgroundService
                 .ConfigureAwait(false);
             if (davItem is null) return;
 
-            // Give each worker the full local fan-out deliberately. The process-wide gate is
-            // authoritative; slicing this value by worker count would strand capacity whenever
-            // fewer workers have runnable verification operations.
             await PerformHealthCheck(
                     davItem,
                     dbClient,
-                    _configManager.GetHealthCheckConcurrency(),
                     workerToken)
                 .ConfigureAwait(false);
         }
@@ -457,7 +457,6 @@ public class HealthCheckService : BackgroundService
     (
         DavItem davItem,
         DavDatabaseClient dbClient,
-        int concurrency,
         CancellationToken ct
     )
     {
@@ -501,6 +500,7 @@ public class HealthCheckService : BackgroundService
             var statSegments = nzbFile != null
                 ? FilterSegmentsForStat(sampled, segments, nzbFile, _repairPatchStore)
                 : sampled;
+            var runId = Guid.NewGuid();
 
             // A damaged-but-tolerable video file can only be told apart from a failed one by a
             // full-coverage sweep of an eligible container with recorded segment sizes (#461).
@@ -536,28 +536,44 @@ public class HealthCheckService : BackgroundService
             List<int>? confirmedHoles = null;
             using (statCts = ContextualCancellationTokenSource.CreateLinkedTokenSource(ct))
             {
-                using var healthAdmissionScope = statCts.Token.SetContext(
-                    new HealthCheckAdmissionContext(
-                        _healthCheckConnectionGate,
-                        HealthCheckAdmissionPriority.Background));
                 statCts.CancelAfter(HealthCheckProgressTimeout);
                 var progress = progressHook.ToPercentage(statSegments.Count);
                 if (!canClassify)
                 {
-                    await ArticleExistenceChecker.CheckAsync(
-                        _usenetClient, statSegments, concurrency, progress, statCts.Token).ConfigureAwait(false);
+                    await _healthCheckStatScheduler.RunAsync(
+                            new HealthCheckStatRequest(
+                                runId,
+                                davItem.Id,
+                                PhaseId: 0,
+                                statSegments,
+                                HealthCheckStatMode.VerifyAll),
+                            ExecuteStatAsync,
+                            progress,
+                            statCts.Token)
+                        .ConfigureAwait(false);
                 }
                 else
                 {
                     // Sweep-and-collect every confirmed miss so the damage classifier can weigh
-                    // the full hole set instead of aborting on the first one. STAT sweep chunk
-                    // sizing is fixed in BaseNntpClient; the depth argument is BODY-oriented
-                    // interface baggage and unused here.
-                    var missingIds = await _usenetClient.CollectMissingSegmentsPipelinedAsync(
-                            statSegments, depth: 0, concurrency, progress, statCts.Token)
+                    // the full hole set instead of aborting on the first one. Individual STATs
+                    // use the central scheduler so this phase shares capacity fairly with every
+                    // other active file instead of holding a file-bound pipelined lease.
+                    var result = await _healthCheckStatScheduler.RunAsync(
+                            new HealthCheckStatRequest(
+                                runId,
+                                davItem.Id,
+                                PhaseId: 0,
+                                statSegments,
+                                HealthCheckStatMode.CollectMissing),
+                            ExecuteStatAsync,
+                            progress,
+                            statCts.Token)
                         .ConfigureAwait(false);
+                    var missingIds = result.MissingIndices
+                        .Select(index => statSegments[index])
+                        .ToArray();
                     confirmedHoles = await ConfirmHolesThroughFallbacksAsync(
-                            missingIds, segments, nzbFile!, concurrency, statCts)
+                            runId, davItem.Id, missingIds, segments, nzbFile!, statCts)
                         .ConfigureAwait(false);
                 }
             }
@@ -926,56 +942,74 @@ public class HealthCheckService : BackgroundService
     /// primary and every fallback are definitively missing. Non-definitive responses
     /// throw into the defer catches rather than guessing a verdict.
     /// </summary>
+    private Task<UsenetStatResponse> ExecuteStatAsync(string segmentId, CancellationToken ct) =>
+        _usenetClient.StatAsync(segmentId, ct);
+
     private async Task<List<int>> ConfirmHolesThroughFallbacksAsync(
-        IReadOnlyList<string> primaryMissIds,
+        Guid runId,
+        Guid davItemId,
+        string[] primaryMissIds,
         List<string> segments,
         DavNzbFile nzbFile,
-        int concurrency,
         ContextualCancellationTokenSource statCts)
     {
-        if (primaryMissIds.Count == 0) return [];
+        if (primaryMissIds.Length == 0) return [];
 
         var indexById = segments
             .Select((id, index) => (id, index))
             .ToDictionary(x => x.id, x => x.index, StringComparer.Ordinal);
 
-        var checks = primaryMissIds
+        var unresolved = primaryMissIds
             .Select(missId => (Id: missId, Index: indexById.GetValueOrDefault(missId, -1)))
             .Where(miss => miss.Index >= 0)
-            .Select(async miss => (
-                miss.Index,
-                IsHole: await IsConfirmedHoleAsync(miss.Index, nzbFile, statCts.Token).ConfigureAwait(false)))
-            .WithConcurrencyAsync(concurrency, statCts.Token);
+            .Select(miss => miss.Index)
+            .ToHashSet();
+        var maximumFallbacks = unresolved
+            .Select(index => nzbFile.SegmentFallbackIds is { } fallbackIds
+                             && index < fallbackIds.Length
+                ? fallbackIds[index]?.Length ?? 0
+                : 0)
+            .DefaultIfEmpty(0)
+            .Max();
 
-        var holes = new List<int>();
-        await foreach (var (index, isHole) in checks.ConfigureAwait(false))
+        for (var fallbackIndex = 0;
+             fallbackIndex < maximumFallbacks && unresolved.Count > 0;
+             fallbackIndex++)
         {
-            // keep the no-progress watchdog armed while fallback STATs are in flight
-            statCts.CancelAfter(HealthCheckProgressTimeout);
-            if (isHole) holes.Add(index);
+            var work = unresolved
+                .Order()
+                .Where(index => nzbFile.SegmentFallbackIds is { } fallbackIds
+                                && index < fallbackIds.Length
+                                && fallbackIds[index] is { } alternates
+                                && fallbackIndex < alternates.Length)
+                .Select(index => (
+                    SegmentIndex: index,
+                    FallbackId: nzbFile.SegmentFallbackIds![index]![fallbackIndex]))
+                .ToArray();
+            if (work.Length == 0) continue;
+
+            var fallbackProgress = new SynchronousProgress<int>(
+                _ => statCts.CancelAfter(HealthCheckProgressTimeout));
+            var result = await _healthCheckStatScheduler.RunAsync(
+                    new HealthCheckStatRequest(
+                        runId,
+                        davItemId,
+                        PhaseId: fallbackIndex + 1,
+                        work.Select(item => item.FallbackId).ToArray(),
+                        HealthCheckStatMode.CollectMissing),
+                    ExecuteStatAsync,
+                    fallbackProgress,
+                    statCts.Token)
+                .ConfigureAwait(false);
+            var missingWorkIndices = result.MissingIndices.ToHashSet();
+            for (var workIndex = 0; workIndex < work.Length; workIndex++)
+            {
+                if (!missingWorkIndices.Contains(workIndex))
+                    unresolved.Remove(work[workIndex].SegmentIndex);
+            }
         }
 
-        holes.Sort();
-        return holes;
-    }
-
-    private async Task<bool> IsConfirmedHoleAsync(int segmentIndex, DavNzbFile nzbFile, CancellationToken ct)
-    {
-        if (nzbFile.SegmentFallbackIds is not { } fallbackIds ||
-            segmentIndex >= fallbackIds.Length ||
-            fallbackIds[segmentIndex] is not { Length: > 0 } alternates)
-            return true;
-
-        foreach (var fallbackId in alternates)
-        {
-            var response = await _usenetClient.StatAsync(fallbackId, ct).ConfigureAwait(false);
-            if (response.ResponseType == UsenetResponseType.ArticleExists)
-                return false;
-            if (!UsenetArticleAvailability.IsDefinitiveMissing(response))
-                throw new UsenetUnexpectedResponseException(fallbackId, response.ResponseMessage);
-        }
-
-        return true;
+        return unresolved.Order().ToList();
     }
 
     private async Task<bool> WaitForQueueIdleBeforeRepairAsync(DavItem davItem, CancellationToken ct)
@@ -2091,5 +2125,10 @@ public class HealthCheckService : BackgroundService
             foreach (var segmentId in segmentIds.Where(segmentId => _missingSegmentIds.Contains(segmentId)))
                 throw new UsenetArticleNotFoundException(segmentId);
         }
+    }
+
+    private sealed class SynchronousProgress<T>(Action<T> report) : IProgress<T>
+    {
+        public void Report(T value) => report(value);
     }
 }

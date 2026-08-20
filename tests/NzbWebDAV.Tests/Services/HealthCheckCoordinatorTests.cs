@@ -275,6 +275,7 @@ public sealed class HealthCheckCoordinatorTests
         private readonly UsenetStreamingClient _usenet;
         private readonly QueueManager _queueManager;
         private readonly HealthCheckConnectionGate _gate;
+        private readonly HealthCheckStatScheduler _statScheduler;
         private readonly RepairPatchStore _patchStore;
 
         public ConfigManager Config { get; }
@@ -348,6 +349,8 @@ public sealed class HealthCheckCoordinatorTests
                 new ActiveReadRegistry(),
                 repairPatchStore: _patchStore);
             _gate = new HealthCheckConnectionGate(Config);
+            _statScheduler = new HealthCheckStatScheduler(Config, _gate);
+            _statScheduler.StartAsync(CancellationToken.None).GetAwaiter().GetResult();
             var benchmarkGate = new BenchmarkGate();
             _queueManager = QueueManager.CreateForTests(
                 _usenet,
@@ -368,7 +371,8 @@ public sealed class HealthCheckCoordinatorTests
                 _queueManager,
                 new Par2RepairService(Config, _usenet, _patchStore),
                 _patchStore,
-                _gate);
+                _gate,
+                _statScheduler);
         }
 
         public void SetWorkers(int count)
@@ -386,6 +390,8 @@ public sealed class HealthCheckCoordinatorTests
         {
             Service.Dispose();
             _queueManager.Dispose();
+            _statScheduler.StopAsync(CancellationToken.None).GetAwaiter().GetResult();
+            _statScheduler.Dispose();
             _gate.Dispose();
             _usenet.Dispose();
             try { Directory.Delete(_root, recursive: true); }

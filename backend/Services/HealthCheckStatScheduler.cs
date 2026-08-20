@@ -32,6 +32,7 @@ public sealed record HealthCheckStatSessionSnapshot(
     Guid DavItemId,
     int PhaseId,
     HealthCheckStatMode Mode,
+    string State,
     int InFlight,
     int Completed,
     int Total);
@@ -491,6 +492,7 @@ public sealed class HealthCheckStatScheduler : BackgroundService
                 session.Request.DavItemId,
                 session.Request.PhaseId,
                 session.Request.Mode,
+                session.Status.ToString(),
                 session.InFlight,
                 session.Completed,
                 session.Request.SegmentIds.Count))
