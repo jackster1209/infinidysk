@@ -49,7 +49,11 @@ export function HealthTable({ isEnabled, healthCheckItems }: HealthTableProps) {
                 </tr>
               </thead>
               <tbody>
-                {healthCheckItems.map((item) => (
+                {healthCheckItems.map((item) => {
+                  const statSession = verificationLoad.scheduler.sessions.find(
+                    (session) => session.davItemId === item.id,
+                  );
+                  return (
                   <tr key={item.id} className="border-base-content/10">
                     <td className="max-w-[280px] py-3 pl-4 align-middle md:pl-6 max-[899px]:max-w-none">
                       <div className="flex min-w-0 flex-col gap-1">
@@ -59,6 +63,11 @@ export function HealthTable({ isEnabled, healthCheckItems }: HealthTableProps) {
                         <div className="break-all text-xs leading-snug text-base-content/45">
                           <Truncate>{item.path}</Truncate>
                         </div>
+                                                {statSession && (
+                                                    <div className="font-mono text-[11px] tabular-nums text-info/75">
+                                                        {statSession.inFlight} active STAT · {statSession.completed.toLocaleString()} / {statSession.total.toLocaleString()} complete
+                                                    </div>
+                                                )}
                         <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 min-[900px]:hidden">
                           <MetaChip
                             label="Created"
@@ -85,7 +94,8 @@ export function HealthTable({ isEnabled, healthCheckItems }: HealthTableProps) {
                       )}
                     </td>
                   </tr>
-                ))}
+                                    );
+                                })}
               </tbody>
             </table>
           </div>
@@ -93,6 +103,55 @@ export function HealthTable({ isEnabled, healthCheckItems }: HealthTableProps) {
       </div>
     </section>
   );
+}
+
+function VerificationLoad({ snapshot }: { snapshot: HealthCheckGateSnapshot }) {
+    const utilization = snapshot.limit > 0
+        ? Math.min(100, Math.round((snapshot.active / snapshot.limit) * 100))
+        : 0;
+
+    return (
+        <div className="grid gap-4 border-b border-base-content/10 bg-base-200/30 px-4 py-3 md:grid-cols-[minmax(220px,1fr)_auto_auto_auto] md:items-center md:px-6">
+            <div className="min-w-0">
+                <div className="mb-1.5 flex items-center justify-between gap-3 text-xs">
+                    <span className="inline-flex items-center gap-1.5 font-semibold text-base-content/70">
+                        <Icon name="speed" className="!text-[16px] text-base-content/50" />
+                        Verification load
+                    </span>
+                    <span className="font-mono tabular-nums text-base-content/70">
+                        {snapshot.active} / {snapshot.limit} active
+                    </span>
+                </div>
+                <progress
+                    aria-label="Active health-check verification connections"
+                    className="progress progress-info h-1.5 w-full"
+                    value={utilization}
+                    max={100}
+                />
+            </div>
+            <LoadValue label="Recent active peak" value={`${snapshot.peakActive} / ${snapshot.limit}`} />
+            <LoadValue
+                label="Fair scheduler"
+                value={`${snapshot.scheduler.activeAssignments} active`}
+                detail={`${snapshot.scheduler.runnableSessions} runnable · ${snapshot.scheduler.pendingSegments.toLocaleString()} pending`}
+            />
+            <LoadValue
+                label="Background waiting"
+                value={snapshot.waitingBackground.toLocaleString()}
+                detail={`Recent peak ${snapshot.peakWaitingBackground.toLocaleString()}`}
+            />
+        </div>
+    );
+}
+
+function LoadValue({ label, value, detail }: { label: string; value: string; detail?: string }) {
+    return (
+        <div className="flex items-baseline justify-between gap-4 md:min-w-[130px] md:flex-col md:items-start md:gap-0">
+            <span className="text-[11px] uppercase tracking-wide text-base-content/45">{label}</span>
+            <span className="font-mono text-sm font-semibold tabular-nums text-base-content/80">{value}</span>
+            {detail && <span className="text-[11px] text-base-content/45">{detail}</span>}
+        </div>
+    );
 }
 
 function EmptyState({ title, body }: { title: string; body: string }) {

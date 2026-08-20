@@ -875,7 +875,8 @@ public class MultiConnectionNntpClient(
         HealthCheckConnectionGate.Lease? healthCheckLease = null;
         try
         {
-            if (ct.GetContext<HealthCheckAdmissionContext>() is { } healthCheckContext)
+            if (ct.GetContext<HealthCheckAdmissionContext>() is
+                { GateLeasePreAcquired: false } healthCheckContext)
             {
                 healthCheckLease = await healthCheckContext.Gate
                     .AcquireAsync(healthCheckContext.Priority, ct)

@@ -45,6 +45,26 @@ function loaderArgs(path = "/health") {
 describe("health route loader", () => {
   beforeEach(() => {
     getConfigMock.mockReset();
+    getHealthCheckGateMock.mockReset();
+    getHealthCheckGateMock.mockResolvedValue({
+      limit: 50,
+      active: 0,
+      peakActive: 0,
+      waitingBackground: 0,
+      peakWaitingBackground: 0,
+      scheduler: {
+        capacity: 50,
+        activeAssignments: 0,
+        pendingAdmissions: 0,
+        runnableSessions: 0,
+        pendingSegments: 0,
+        dispatches: 0,
+        completions: 0,
+        cancellations: 0,
+        failures: 0,
+        sessions: [],
+      },
+    });
     getHealthCheckHistoryMock.mockReset();
     getHealthCheckQueueMock.mockReset();
   });
@@ -53,6 +73,25 @@ describe("health route loader", () => {
     const queueItems = [{ id: "queue-1", name: "Example" }];
     const historyStats = [{ result: 0, repairStatus: 0, count: 4 }];
     const historyItems = [{ id: "history-1", path: "/view/example.mkv" }];
+    const verificationLoad = {
+      limit: 50,
+      active: 18,
+      peakActive: 40,
+      waitingBackground: 12,
+      peakWaitingBackground: 30,
+      scheduler: {
+        capacity: 50,
+        activeAssignments: 0,
+        pendingAdmissions: 0,
+        runnableSessions: 0,
+        pendingSegments: 0,
+        dispatches: 0,
+        completions: 0,
+        cancellations: 0,
+        failures: 0,
+        sessions: [],
+      },
+    };
     getHealthCheckQueueMock.mockResolvedValueOnce({
       uncheckedCount: 12,
       items: queueItems,

@@ -49,6 +49,37 @@ public class MultiConnectionConnectionBudgetTests
     }
 
     [Fact]
+    public async Task PreAcquiredHealthAdmission_IsNotAcquiredAgainByProviderClient()
+    {
+        var config = new ConfigManager();
+        config.UpdateValues([
+            new ConfigItem
+            {
+                ConfigName = ConfigKeys.RepairHealthcheckConcurrency,
+                ConfigValue = "1",
+            },
+        ]);
+        using var gate = new HealthCheckConnectionGate(config);
+        using var gateLease = await gate.AcquireAsync(
+            HealthCheckAdmissionPriority.Background, CancellationToken.None);
+        var state = new BlockingStatState();
+        using var client = CreateClient(state, maxTransferConnections: null);
+        using var cts = new CancellationTokenSource();
+        using var healthContext = cts.Token.SetContext(
+            new HealthCheckAdmissionContext(
+                gate,
+                HealthCheckAdmissionPriority.Background,
+                GateLeasePreAcquired: true));
+
+        var request = client.StatAsync("pre-acquired@example", cts.Token);
+        await WaitForEnteredCount(state, expected: 1);
+
+        Assert.Equal(1, gate.GetSnapshot().Active);
+        state.ReleaseAll();
+        await request.WaitAsync(TestTimeout);
+    }
+
+    [Fact]
     public async Task NullTransferLimitPreservesLegacySharedPoolWidth()
     {
         var state = new BlockingStatState();
