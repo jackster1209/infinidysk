@@ -27,6 +27,11 @@ function isIntegerInRange(value: string, minimum: number, maximum: number) {
         && value.trim() === num.toString();
 }
 
+function isWholeNumber(value: string) {
+    const trimmed = value.trim();
+    return trimmed !== "" && /^[-+]?\d+$/.test(trimmed);
+}
+
 export function RepairsSettings({ config, setNewConfig }: RepairsSettingsProps) {
   const libraryDirConfig = config["media.library-dir"];
   // `arr.instances` config value shape (backend contract)
@@ -112,7 +117,7 @@ export function RepairsSettings({ config, setNewConfig }: RepairsSettingsProps) 
                 Maximum Health Check Connections
               </label>
               <Input
-                    className={`w-full ${!isIntegerInRange(config["repair.healthcheck-concurrency"] || "50", 1, 200) ? "input-error" : ""}`}
+                    className={`w-full ${!isWholeNumber(config["repair.healthcheck-concurrency"] || "50") ? "input-error" : ""}`}
                 type="text"
                 id="healthcheck-concurrency-input"
                 aria-describedby="healthcheck-concurrency-help"
@@ -128,7 +133,8 @@ export function RepairsSettings({ config, setNewConfig }: RepairsSettingsProps) 
               >
                 Maximum aggregate NNTP verification connections shared by background health checks and
                 queue article-existence validation. Actual use may be lower because provider connection
-                capacity and Transfer/Metadata admission remain authoritative.
+                    capacity and Transfer/Metadata admission remain authoritative. Existing numeric values are
+                    accepted and safely limited at runtime to 1–200 and the total pooled provider capacity.
               </p>
             </div>
           </ManagedSetting>
@@ -672,7 +678,7 @@ export function isRepairsSettingsValid(newConfig: Record<string, string>) {
     "repair.degraded-max-total-missing",
   ] as const;
   const concurrencyOk =
-    concurrency === undefined || concurrency === "" || isIntegerInRange(concurrency, 1, 200);
+    concurrency === undefined || concurrency === "" || isWholeNumber(concurrency);
   const workersOk =
     workers === undefined || workers === "" || isIntegerInRange(workers, 1, 8);
   const autoRemoveOk =
