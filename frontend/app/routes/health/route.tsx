@@ -17,6 +17,9 @@ import type {
 } from "~/clients/backend-client.server";
 import {
   completeHealthCheck,
+  getVisibleHealthCheckItems,
+  parseHealthItemProgressMessage,
+  parseHealthItemStatusMessage,
   type HealthQueueState,
   updateHealthCheckProgress,
 } from "./health-queue-state";
@@ -172,12 +175,13 @@ export default function Health({ loaderData }: Route.ComponentProps) {
   // events
   const onHealthItemStatus = useCallback(
     (message: string) => {
-      const [davItemId, healthResult, repairAction] = message.split("|");
-      setQueueState((x) => completeHealthCheck(x, davItemId!));
+      const status = parseHealthItemStatusMessage(message);
+      if (!status) return;
+      setQueueState((x) => completeHealthCheck(x, status.davItemId));
       setHistoryStats((x) => {
         // 'hs' websocket payload carries numeric HealthResult / RepairAction enum values
-        const healthResultNum: HealthResult = Number(healthResult);
-        const repairActionNum: RepairAction = Number(repairAction);
+        const healthResultNum: HealthResult = status.healthResult;
+        const repairActionNum: RepairAction = status.repairAction;
 
         // attempt to find and update a matching statistic
         let updated = false;
@@ -210,10 +214,14 @@ export default function Health({ loaderData }: Route.ComponentProps) {
 
   const onHealthItemProgress = useCallback(
     (message: string) => {
-      const [davItemId, progress] = message.split("|");
-      if (progress === "done") return;
+      const progressUpdate = parseHealthItemProgressMessage(message);
+      if (!progressUpdate) return;
       setQueueState((queueState) =>
-        updateHealthCheckProgress(queueState, davItemId!, Number(progress)),
+        updateHealthCheckProgress(
+          queueState,
+          progressUpdate.davItemId,
+          progressUpdate.progress,
+        ),
       );
     },
     [setQueueState],
@@ -260,7 +268,7 @@ export default function Health({ loaderData }: Route.ComponentProps) {
       />
       <HealthTable
         isEnabled={isEnabled}
-        healthCheckItems={queueItems.filter((_, index) => index < 10)}
+        healthCheckItems={getVisibleHealthCheckItems(queueItems)}
       />
     </div>
   );

@@ -32,3 +32,39 @@ export function updateHealthCheckProgress(
             : item),
     };
 }
+
+export function parseHealthItemProgressMessage(message: string): {
+    davItemId: string,
+    progress: number,
+} | null {
+    const parts = message.split("|");
+    if (parts.length !== 2) return null;
+    const [davItemId, progressValue] = parts;
+    if (!davItemId || progressValue === "done") return null;
+    const progress = Number(progressValue);
+    if (!Number.isFinite(progress) || progress < 0 || progress > 100) return null;
+    return { davItemId, progress };
+}
+
+export function parseHealthItemStatusMessage(message: string): {
+    davItemId: string,
+    healthResult: number,
+    repairAction: number,
+} | null {
+    const parts = message.split("|");
+    if (parts.length !== 3) return null;
+    const [davItemId, healthResultValue, repairActionValue] = parts;
+    const healthResult = Number(healthResultValue);
+    const repairAction = Number(repairActionValue);
+    if (!davItemId || !Number.isInteger(healthResult) || !Number.isInteger(repairAction)) return null;
+    return { davItemId, healthResult, repairAction };
+}
+
+export function getVisibleHealthCheckItems(
+    items: HealthCheckQueueItem[],
+    maximumCount = 10,
+): HealthCheckQueueItem[] {
+    const progressing = items.filter(item => item.progress > 0);
+    const waiting = items.filter(item => item.progress <= 0);
+    return [...progressing, ...waiting].slice(0, maximumCount);
+}
