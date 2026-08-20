@@ -135,7 +135,8 @@ public class HealthCheckService : BackgroundService
         {
             await Task.Delay(StartupGracePeriod, stoppingToken).ConfigureAwait(false);
         }
-        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+        catch (OperationCanceledException) when (
+            stoppingToken.IsCancellationRequested || SigtermUtil.IsSigtermTriggered())
         {
             return;
         }
@@ -151,7 +152,8 @@ public class HealthCheckService : BackgroundService
                     await RefillWorkerSlotsAsync(stoppingToken).ConfigureAwait(false);
                     await WaitForCoordinatorWakeAsync(stoppingToken).ConfigureAwait(false);
                 }
-                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+                catch (OperationCanceledException) when (
+                    stoppingToken.IsCancellationRequested || SigtermUtil.IsSigtermTriggered())
                 {
                     break;
                 }
@@ -174,7 +176,8 @@ public class HealthCheckService : BackgroundService
                 }
             }
         }
-        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+        catch (OperationCanceledException) when (
+            stoppingToken.IsCancellationRequested || SigtermUtil.IsSigtermTriggered())
         {
             // Normal hosted-service shutdown.
         }
@@ -188,7 +191,8 @@ public class HealthCheckService : BackgroundService
             if (workers.Length > 0)
             {
                 try { await Task.WhenAll(workers).ConfigureAwait(false); }
-                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { }
+                catch (OperationCanceledException) when (
+                    stoppingToken.IsCancellationRequested || SigtermUtil.IsSigtermTriggered()) { }
             }
         }
     }
@@ -204,23 +208,48 @@ public class HealthCheckService : BackgroundService
 
             var allowUrgentRepair = !queueActive;
             var activeIds = _inProgress.Keys.ToHashSet();
-            var candidateId = SelectCandidateOverride is { } selector
-                ? await selector(activeIds, allowUrgentRepair, ct).ConfigureAwait(false)
-                : await SelectNextHealthCheckIdAsync(activeIds, allowUrgentRepair, ct)
-                    .ConfigureAwait(false);
-            if (candidateId is not { } id) return;
+            if (SelectCandidateOverride is { } selector)
+            {
+                var candidateId = await selector(activeIds, allowUrgentRepair, ct).ConfigureAwait(false);
+                if (candidateId is not { } id || !TryStartWorker(id, ct)) return;
+                continue;
+            }
 
-            var worker = new InProgressHealthCheck();
-            if (!_inProgress.TryAdd(id, worker)) return;
-            worker.ProcessingTask = RunHealthCheckWorkerAsync(id, ct);
+            var availableSlots = _configManager.GetHealthCheckWorkers() - _inProgress.Count;
+            var candidateIds = await SelectNextHealthCheckIdsAsync(
+                    activeIds,
+                    allowUrgentRepair,
+                    availableSlots,
+                    ct)
+                    .ConfigureAwait(false);
+            if (candidateIds.Count == 0) return;
+
+            foreach (var id in candidateIds)
+            {
+                if (_inProgress.Count >= _configManager.GetHealthCheckWorkers()) break;
+                _ = TryStartWorker(id, ct);
+            }
+
+            return;
         }
     }
 
-    private async Task<Guid?> SelectNextHealthCheckIdAsync(
+    private bool TryStartWorker(Guid id, CancellationToken ct)
+    {
+            var worker = new InProgressHealthCheck();
+        if (!_inProgress.TryAdd(id, worker)) return false;
+            worker.ProcessingTask = RunHealthCheckWorkerAsync(id, ct);
+        return true;
+    }
+
+    internal async Task<IReadOnlyList<Guid>> SelectNextHealthCheckIdsAsync(
         HashSet<Guid> activeIds,
         bool allowUrgentRepair,
+        int maximumCount,
         CancellationToken ct)
     {
+        if (maximumCount <= 0) return [];
+
         await using var dbContext = CreateDbContext();
         var dbClient = new DavDatabaseClient(dbContext);
         var currentDateTime = DateTimeOffset.UtcNow;
@@ -232,19 +261,22 @@ public class HealthCheckService : BackgroundService
             queue = queue.Where(
                 item => item.NextHealthCheck != DateTimeOffset.UnixEpoch);
 
+        var selected = new List<Guid>(maximumCount);
         await foreach (var item in queue
             .AsAsyncEnumerable()
             .WithCancellation(ct)
             .ConfigureAwait(false))
         {
-            if (item.NextHealthCheck == DateTimeOffset.UnixEpoch
-                || FilenameUtil.IsHealthCheckCandidate(item.Name))
+            var isUrgent = item.NextHealthCheck == DateTimeOffset.UnixEpoch;
+            if ((allowUrgentRepair && isUrgent)
+                || (!isUrgent && FilenameUtil.IsHealthCheckCandidate(item.Name)))
             {
-                return item.Id;
+                selected.Add(item.Id);
+                if (selected.Count == maximumCount) break;
             }
         }
 
-        return null;
+        return selected;
     }
 
     private async Task RunHealthCheckWorkerAsync(Guid davItemId, CancellationToken ct)
@@ -273,7 +305,7 @@ public class HealthCheckService : BackgroundService
                     workerToken)
                 .ConfigureAwait(false);
         }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        catch (OperationCanceledException) when (workerToken.IsCancellationRequested)
         {
             // Normal hosted-service shutdown.
         }
@@ -858,7 +890,9 @@ public class HealthCheckService : BackgroundService
 
         // One bounded head read per file, ever: the probed class is persisted with the
         // hole record. Runs inside the caller's maintenance download context (attribution)
-        // and cancellation scope; early disposal of the body stream is by design.
+        // and cancellation scope; early disposal of the body stream is by design. This is
+        // one direct segment fetch and stream read: it never issues a nested NNTP request
+        // while the returned physical connection is still held.
         using var healthAdmissionScope = ct.SetContext(
             new HealthCheckAdmissionContext(
                 _healthCheckConnectionGate,

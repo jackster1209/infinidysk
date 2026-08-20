@@ -1,8 +1,10 @@
 using System.Collections.Concurrent;
 using System.Text.Json;
+using Microsoft.EntityFrameworkCore;
 using NzbWebDAV.Clients.Usenet;
 using NzbWebDAV.Clients.RadarrSonarr;
 using NzbWebDAV.Config;
+using NzbWebDAV.Database;
 using NzbWebDAV.Database.Models;
 using NzbWebDAV.Models;
 using NzbWebDAV.Queue;
@@ -11,6 +13,7 @@ using NzbWebDAV.Services.Metrics;
 using NzbWebDAV.Services.Repair;
 using NzbWebDAV.Services.StreamTrace;
 using NzbWebDAV.Websocket;
+using Xunit.Sdk;
 
 namespace NzbWebDAV.Tests.Services;
 
@@ -64,7 +67,7 @@ public sealed class HealthCheckCoordinatorTests
     }
 
     [Fact]
-    public async Task Reservation_PreventsTwoWorkersClaimingTheSameItem()
+    public async Task DuplicateReservation_IsRejectedByInMemoryGuard()
     {
         using var harness = new Harness(workers: 2, fullySplit: false);
         var id = Guid.NewGuid();
@@ -161,11 +164,107 @@ public sealed class HealthCheckCoordinatorTests
         await WaitUntilAsync(() => split.Service.InProgressHealthCheckIds.Count == 0);
     }
 
+    [Fact]
+    public async Task ProductionSelection_PreservesOrderingAndExcludesUrgentDuringQueueActivity()
+    {
+        using var harness = new Harness(workers: 3, fullySplit: true);
+        var databasePath = Path.Join(
+            Path.GetTempPath(),
+            $"infinidysk-health-selection-{Guid.NewGuid():N}.sqlite");
+        var options = new DbContextOptionsBuilder<DavDatabaseContext>()
+            .UseSqlite($"Data Source={databasePath}")
+            .Options;
+        var urgent = NewCandidate("urgent.mkv", DateTimeOffset.UnixEpoch);
+        var neverChecked = NewCandidate("never-checked.mkv", null);
+        var scheduled = NewCandidate("scheduled.mkv", DateTimeOffset.UtcNow - TimeSpan.FromHours(1));
+        var nonMedia = NewCandidate("notes.nfo", null);
+        try
+        {
+            await using (var db = new DavDatabaseContext(options))
+            {
+                await db.Database.EnsureCreatedAsync();
+                db.Items.AddRange(urgent, neverChecked, scheduled, nonMedia);
+                await db.SaveChangesAsync();
+            }
+            harness.Service.CreateDbContextOverride = () => new DavDatabaseContext(options);
+
+            var idleSelection = await harness.Service.SelectNextHealthCheckIdsAsync(
+                [], allowUrgentRepair: true, maximumCount: 3, CancellationToken.None);
+            var queueActiveSelection = await harness.Service.SelectNextHealthCheckIdsAsync(
+                [neverChecked.Id], allowUrgentRepair: false, maximumCount: 3, CancellationToken.None);
+
+            Assert.Equal([urgent.Id, neverChecked.Id, scheduled.Id], idleSelection);
+            Assert.Equal([scheduled.Id], queueActiveSelection);
+        }
+        finally
+        {
+            try { File.Delete(databasePath); } catch (IOException) { }
+        }
+    }
+
+    [Fact]
+    public async Task ProductionWorker_UsesItsOwnContextAndRecordsMissingPayload()
+    {
+        using var harness = new Harness(workers: 1, fullySplit: false);
+        var databasePath = Path.Join(
+            Path.GetTempPath(),
+            $"infinidysk-health-worker-{Guid.NewGuid():N}.sqlite");
+        var options = new DbContextOptionsBuilder<DavDatabaseContext>()
+            .UseSqlite($"Data Source={databasePath}")
+            .Options;
+        var candidate = NewCandidate("missing-payload.mkv", null);
+        try
+        {
+            await using (var db = new DavDatabaseContext(options))
+            {
+                await db.Database.EnsureCreatedAsync();
+                db.Items.Add(candidate);
+                await db.SaveChangesAsync();
+            }
+            harness.Service.CreateDbContextOverride = () => new DavDatabaseContext(options);
+
+            await harness.Service.RefillWorkerSlotsAsync(CancellationToken.None);
+            await WaitUntilAsync(() => harness.Service.InProgressHealthCheckIds.Count == 0);
+
+            await using var verificationDb = new DavDatabaseContext(options);
+            var result = Assert.Single(await verificationDb.HealthCheckResults.ToListAsync());
+            Assert.Equal(candidate.Id, result.DavItemId);
+            Assert.Contains("streaming data is missing", result.Message);
+        }
+        finally
+        {
+            try { File.Delete(databasePath); } catch (IOException) { }
+        }
+    }
+
     private static async Task WaitUntilAsync(Func<bool> condition)
     {
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(2));
-        while (!condition())
-            await Task.Delay(10, timeout.Token);
+        try
+        {
+            while (!condition())
+                await Task.Delay(10, timeout.Token);
+        }
+        catch (OperationCanceledException) when (timeout.IsCancellationRequested)
+        {
+            throw new XunitException("Timed out waiting for the health coordinator condition.");
+        }
+    }
+
+    private static DavItem NewCandidate(string name, DateTimeOffset? nextHealthCheck)
+    {
+        var id = Guid.NewGuid();
+        return new DavItem
+        {
+            Id = id,
+            IdPrefix = id.ToString("N")[..DavItem.IdPrefixLength],
+            CreatedAt = DateTime.UtcNow,
+            Name = name,
+            Type = DavItem.ItemType.UsenetFile,
+            SubType = DavItem.ItemSubType.NzbFile,
+            Path = $"/library/{name}",
+            NextHealthCheck = nextHealthCheck,
+        };
     }
 
     private sealed class Harness : IDisposable
