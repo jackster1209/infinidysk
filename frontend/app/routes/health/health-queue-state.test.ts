@@ -1,6 +1,13 @@
 import { describe, expect, it } from "vitest";
 import type { HealthCheckQueueItem } from "~/clients/backend-client.server";
-import { completeHealthCheck, type HealthQueueState, updateHealthCheckProgress } from "./health-queue-state";
+import {
+    completeHealthCheck,
+    getVisibleHealthCheckItems,
+    parseHealthItemProgressMessage,
+    parseHealthItemStatusMessage,
+    type HealthQueueState,
+    updateHealthCheckProgress,
+} from "./health-queue-state";
 
 function queueItem(id: string, nextHealthCheck: string | null): HealthCheckQueueItem {
     return {
@@ -83,5 +90,41 @@ describe("updateHealthCheckProgress", () => {
         };
 
         expect(updateHealthCheckProgress(state, "completed", 100)).toBe(state);
+    });
+});
+
+describe("health websocket payload parsing", () => {
+    it("accepts valid progress and status payloads", () => {
+        expect(parseHealthItemProgressMessage("item-id|42")).toEqual({
+            davItemId: "item-id",
+            progress: 42,
+        });
+        expect(parseHealthItemStatusMessage("item-id|1|2")).toEqual({
+            davItemId: "item-id",
+            healthResult: 1,
+            repairAction: 2,
+        });
+    });
+
+    it("ignores malformed payloads", () => {
+        expect(parseHealthItemProgressMessage("missing-progress")).toBeNull();
+        expect(parseHealthItemProgressMessage("item-id|NaN")).toBeNull();
+        expect(parseHealthItemProgressMessage("item-id|101")).toBeNull();
+        expect(parseHealthItemProgressMessage("item-id|done")).toBeNull();
+        expect(parseHealthItemStatusMessage("item-id|not-a-result|2")).toBeNull();
+        expect(parseHealthItemStatusMessage("|1|2")).toBeNull();
+    });
+});
+
+describe("getVisibleHealthCheckItems", () => {
+    it("surfaces progressing checks ahead of the visible waiting rows", () => {
+        const items = Array.from({ length: 12 }, (_, index) => queueItem(`item-${index}`, null));
+        items[11] = { ...items[11]!, progress: 35 };
+
+        const visible = getVisibleHealthCheckItems(items);
+
+        expect(visible).toHaveLength(10);
+        expect(visible[0]!.id).toBe("item-11");
+        expect(visible.map(item => item.id)).not.toContain("item-9");
     });
 });
