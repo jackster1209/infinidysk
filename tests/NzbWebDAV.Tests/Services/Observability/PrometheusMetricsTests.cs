@@ -131,6 +131,39 @@ public sealed class PrometheusMetricsTests
         Assert.Contains("nzbdav_health_check_gate_peak_waiting{priority=\"background\"} 120", exposition);
     }
 
+    [Fact]
+    public async Task HealthCheckSchedulerMetricsExposeBoundedAggregateState()
+    {
+        var registry = new CollectorRegistry();
+        var metrics = new PrometheusMetrics(registry);
+
+        metrics.SetHealthCheckScheduler(new HealthCheckStatSchedulerSnapshot(
+            Capacity: 50,
+            ActiveAssignments: 40,
+            PendingAdmissions: 10,
+            RunnableSessions: 5,
+            PendingSegments: 12_345,
+            Dispatches: 500,
+            Completions: 450,
+            Cancellations: 2,
+            Failures: 3,
+            Sessions: []));
+        var exposition = await ExportAsync(registry);
+
+        Assert.Contains("nzbdav_health_check_scheduler_capacity 50", exposition);
+        Assert.Contains("nzbdav_health_check_scheduler_active_assignments 40", exposition);
+        Assert.Contains("nzbdav_health_check_scheduler_pending_admissions 10", exposition);
+        Assert.Contains("nzbdav_health_check_scheduler_runnable_sessions 5", exposition);
+        Assert.Contains("nzbdav_health_check_scheduler_sessions{state=\"running\"} 0", exposition);
+        Assert.Contains("nzbdav_health_check_scheduler_pending_segments 12345", exposition);
+        Assert.Contains("nzbdav_health_check_scheduler_dispatches_total 500", exposition);
+        Assert.Contains("nzbdav_health_check_scheduler_completions_total 450", exposition);
+        Assert.Contains("nzbdav_health_check_scheduler_cancellations_total 2", exposition);
+        Assert.Contains("nzbdav_health_check_scheduler_failures_total 3", exposition);
+        Assert.DoesNotContain("run_id", exposition);
+        Assert.DoesNotContain("dav_item_id", exposition);
+    }
+
     private static async Task<string> ExportAsync(CollectorRegistry registry)
     {
         await using var stream = new MemoryStream();

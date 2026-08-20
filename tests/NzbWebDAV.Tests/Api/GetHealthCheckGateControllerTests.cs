@@ -16,6 +16,7 @@ public sealed class GetHealthCheckGateControllerTests
     {
         var config = CreateConfig(limit: 2);
         using var gate = new HealthCheckConnectionGate(config);
+        using var scheduler = new HealthCheckStatScheduler(config, gate);
         using var first = await gate.AcquireAsync(
             HealthCheckAdmissionPriority.Background, CancellationToken.None);
         using var second = await gate.AcquireAsync(
@@ -26,7 +27,7 @@ public sealed class GetHealthCheckGateControllerTests
         first.Dispose();
         using var third = await waiting.WaitAsync(TimeSpan.FromSeconds(1));
 
-        var controller = new TestController(gate)
+        var controller = new TestController(gate, scheduler)
         {
             ControllerContext = new ControllerContext
             {
@@ -42,6 +43,9 @@ public sealed class GetHealthCheckGateControllerTests
         Assert.Equal(2, response.PeakActive);
         Assert.Equal(0, response.WaitingBackground);
         Assert.Equal(1, response.PeakWaitingBackground);
+        Assert.Equal(2, response.Scheduler.Capacity);
+        Assert.Equal(0, response.Scheduler.ActiveAssignments);
+        Assert.Empty(response.Scheduler.Sessions);
     }
 
     private static ConfigManager CreateConfig(int limit)
@@ -78,8 +82,10 @@ public sealed class GetHealthCheckGateControllerTests
         return config;
     }
 
-    private sealed class TestController(HealthCheckConnectionGate gate)
-        : GetHealthCheckGateController(gate)
+    private sealed class TestController(
+        HealthCheckConnectionGate gate,
+        HealthCheckStatScheduler scheduler)
+        : GetHealthCheckGateController(gate, scheduler)
     {
         protected override bool RequiresAuthentication => false;
 

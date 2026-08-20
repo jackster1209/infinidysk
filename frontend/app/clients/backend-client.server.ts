@@ -878,6 +878,31 @@ export type HealthCheckGateSnapshot = {
     peakActive: number,
     waitingBackground: number,
     peakWaitingBackground: number,
+    scheduler: HealthCheckStatSchedulerSnapshot,
+}
+
+export type HealthCheckStatSchedulerSnapshot = {
+    capacity: number,
+    activeAssignments: number,
+    pendingAdmissions: number,
+    runnableSessions: number,
+    pendingSegments: number,
+    dispatches: number,
+    completions: number,
+    cancellations: number,
+    failures: number,
+    sessions: HealthCheckStatSessionSnapshot[],
+}
+
+export type HealthCheckStatSessionSnapshot = {
+    runId: string,
+    davItemId: string,
+    phaseId: number,
+    mode: string,
+    state: string,
+    inFlight: number,
+    completed: number,
+    total: number,
 }
 
 export type HealthCheckQueueItem = {

@@ -65,6 +65,16 @@ public sealed class PrometheusMetrics
     private readonly Gauge _healthCheckGatePeakActive;
     private readonly Gauge _healthCheckGateWaiting;
     private readonly Gauge _healthCheckGatePeakWaiting;
+    private readonly Gauge _healthCheckSchedulerCapacity;
+    private readonly Gauge _healthCheckSchedulerActive;
+    private readonly Gauge _healthCheckSchedulerPendingAdmissions;
+    private readonly Gauge _healthCheckSchedulerRunnableSessions;
+    private readonly Gauge _healthCheckSchedulerSessions;
+    private readonly Gauge _healthCheckSchedulerPendingSegments;
+    private readonly Counter _healthCheckSchedulerDispatches;
+    private readonly Counter _healthCheckSchedulerCompletions;
+    private readonly Counter _healthCheckSchedulerCancellations;
+    private readonly Counter _healthCheckSchedulerFailures;
     private readonly HashSet<string> _providerKeys = new(StringComparer.Ordinal);
 
     public PrometheusMetrics(CollectorRegistry registry)
@@ -189,6 +199,37 @@ public sealed class PrometheusMetrics
             "nzbdav_health_check_gate_peak_waiting",
             "Maximum health verification operations waiting for admission since the previous metrics refresh.",
             new GaugeConfiguration { LabelNames = ["priority"] });
+        _healthCheckSchedulerCapacity = metrics.CreateGauge(
+            "nzbdav_health_check_scheduler_capacity",
+            "Configured background STAT scheduler capacity.");
+        _healthCheckSchedulerActive = metrics.CreateGauge(
+            "nzbdav_health_check_scheduler_active_assignments",
+            "Current background STAT assignments executing under scheduler-owned gate leases.");
+        _healthCheckSchedulerPendingAdmissions = metrics.CreateGauge(
+            "nzbdav_health_check_scheduler_pending_admissions",
+            "Anonymous background gate admissions requested by the STAT scheduler.");
+        _healthCheckSchedulerRunnableSessions = metrics.CreateGauge(
+            "nzbdav_health_check_scheduler_runnable_sessions",
+            "Health-check sessions with undispatched STAT work.");
+        _healthCheckSchedulerSessions = metrics.CreateGauge(
+            "nzbdav_health_check_scheduler_sessions",
+            "Registered background STAT scheduler sessions by state.",
+            new GaugeConfiguration { LabelNames = ["state"] });
+        _healthCheckSchedulerPendingSegments = metrics.CreateGauge(
+            "nzbdav_health_check_scheduler_pending_segments",
+            "Undispatched background health-check STAT segments.");
+        _healthCheckSchedulerDispatches = metrics.CreateCounter(
+            "nzbdav_health_check_scheduler_dispatches_total",
+            "Background STAT assignments dispatched by the scheduler.");
+        _healthCheckSchedulerCompletions = metrics.CreateCounter(
+            "nzbdav_health_check_scheduler_completions_total",
+            "Background STAT assignments completed by the scheduler.");
+        _healthCheckSchedulerCancellations = metrics.CreateCounter(
+            "nzbdav_health_check_scheduler_cancellations_total",
+            "Background STAT sessions cancelled by the scheduler.");
+        _healthCheckSchedulerFailures = metrics.CreateCounter(
+            "nzbdav_health_check_scheduler_failures_total",
+            "Background STAT sessions failed by the scheduler.");
     }
 
     public static PrometheusMetrics? Current { get; set; }
@@ -235,6 +276,24 @@ public sealed class PrometheusMetrics
         _healthCheckGateWaiting.WithLabels("background").Set(snapshot.WaitingBackground);
         _healthCheckGatePeakWaiting.WithLabels("queue").Set(snapshot.PeakWaitingQueue);
         _healthCheckGatePeakWaiting.WithLabels("background").Set(snapshot.PeakWaitingBackground);
+    }
+
+    internal void SetHealthCheckScheduler(HealthCheckStatSchedulerSnapshot snapshot)
+    {
+        _healthCheckSchedulerCapacity.Set(snapshot.Capacity);
+        _healthCheckSchedulerActive.Set(snapshot.ActiveAssignments);
+        _healthCheckSchedulerPendingAdmissions.Set(snapshot.PendingAdmissions);
+        _healthCheckSchedulerRunnableSessions.Set(snapshot.RunnableSessions);
+        foreach (var state in new[] { "running", "cancelling", "failed" })
+        {
+            _healthCheckSchedulerSessions.WithLabels(state).Set(snapshot.Sessions.Count(session =>
+                string.Equals(session.State, state, StringComparison.OrdinalIgnoreCase)));
+        }
+        _healthCheckSchedulerPendingSegments.Set(snapshot.PendingSegments);
+        _healthCheckSchedulerDispatches.IncTo(snapshot.Dispatches);
+        _healthCheckSchedulerCompletions.IncTo(snapshot.Completions);
+        _healthCheckSchedulerCancellations.IncTo(snapshot.Cancellations);
+        _healthCheckSchedulerFailures.IncTo(snapshot.Failures);
     }
 
     public void Refresh(
