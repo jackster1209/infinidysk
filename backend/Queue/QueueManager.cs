@@ -93,11 +93,36 @@ public sealed class QueueManager : IQueueCoordinator, IDisposable
     ) : this(
         usenetClient, configManager, websocketManager, providerUsageTracker,
         watchdogLog, sourceTracker, benchmarkGate, startLoop: false,
-        healthCheckConnectionGate, dbContextFactory)
+        healthCheckConnectionGate, ownsHealthCheckConnectionGate: false,
+        dbContextFactory: dbContextFactory)
     {
     }
 
     internal QueueManager(
+        UsenetStreamingClient usenetClient,
+        ConfigManager configManager,
+        WebsocketManager websocketManager,
+        ProviderUsageTracker providerUsageTracker,
+        WatchdogLog watchdogLog,
+        QueueItemSourceTracker sourceTracker,
+        BenchmarkGate benchmarkGate,
+        bool startLoop
+    ) : this(
+        usenetClient,
+        configManager,
+        websocketManager,
+        providerUsageTracker,
+        watchdogLog,
+        sourceTracker,
+        benchmarkGate,
+        startLoop,
+        new HealthCheckConnectionGate(configManager),
+        ownsHealthCheckConnectionGate: true,
+        dbContextFactory: null)
+    {
+    }
+
+    internal static QueueManager CreateForTests(
         UsenetStreamingClient usenetClient,
         ConfigManager configManager,
         WebsocketManager websocketManager,
@@ -110,6 +135,34 @@ public sealed class QueueManager : IQueueCoordinator, IDisposable
         IDbContextFactory<DavDatabaseContext>? dbContextFactory = null
     )
     {
+        var gate = healthCheckConnectionGate ?? new HealthCheckConnectionGate(configManager);
+        return new QueueManager(
+            usenetClient,
+            configManager,
+            websocketManager,
+            providerUsageTracker,
+            watchdogLog,
+            sourceTracker,
+            benchmarkGate,
+            startLoop,
+            gate,
+            ownsHealthCheckConnectionGate: healthCheckConnectionGate is null,
+            dbContextFactory: dbContextFactory);
+    }
+
+    private QueueManager(
+        UsenetStreamingClient usenetClient,
+        ConfigManager configManager,
+        WebsocketManager websocketManager,
+        ProviderUsageTracker providerUsageTracker,
+        WatchdogLog watchdogLog,
+        QueueItemSourceTracker sourceTracker,
+        BenchmarkGate benchmarkGate,
+        bool startLoop,
+        HealthCheckConnectionGate healthCheckConnectionGate,
+        bool ownsHealthCheckConnectionGate,
+        IDbContextFactory<DavDatabaseContext>? dbContextFactory)
+    {
         _usenetClient = usenetClient;
         _configManager = configManager;
         _websocketManager = websocketManager;
@@ -118,9 +171,8 @@ public sealed class QueueManager : IQueueCoordinator, IDisposable
         _sourceTracker = sourceTracker;
         _benchmarkGate = benchmarkGate;
         _dbContextFactory = dbContextFactory;
-        _healthCheckConnectionGate = healthCheckConnectionGate
-                                     ?? new HealthCheckConnectionGate(configManager);
-        _ownsHealthCheckConnectionGate = healthCheckConnectionGate is null;
+        _healthCheckConnectionGate = healthCheckConnectionGate;
+        _ownsHealthCheckConnectionGate = ownsHealthCheckConnectionGate;
         _cancellationTokenSource = CancellationTokenSource
             .CreateLinkedTokenSource(SigtermUtil.GetCancellationToken());
         if (startLoop)

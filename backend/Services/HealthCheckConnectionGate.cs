@@ -92,8 +92,8 @@ public sealed class HealthCheckConnectionGate : IDisposable
         List<(TaskCompletionSource<Lease> Completion, Lease Lease)> ready;
         lock (_lock)
         {
-            _active--;
             if (_disposed) return;
+            _active--;
             ready = DispatchWaiters();
         }
 

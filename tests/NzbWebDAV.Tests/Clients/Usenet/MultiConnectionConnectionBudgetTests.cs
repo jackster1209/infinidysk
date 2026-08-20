@@ -10,6 +10,40 @@ namespace NzbWebDAV.Tests.Clients.Usenet;
 public class MultiConnectionConnectionBudgetTests
 {
     [Fact]
+    public async Task HealthAdmission_IsSharedAcrossProvidersBeforePhysicalPoolAcquisition()
+    {
+        var config = new ConfigManager();
+        config.UpdateValues([
+            new ConfigItem
+            {
+                ConfigName = ConfigKeys.RepairHealthcheckConcurrency,
+                ConfigValue = "1",
+            },
+        ]);
+        using var gate = new HealthCheckConnectionGate(config);
+        var state = new BlockingStatState();
+        using var firstProvider = CreateClient(state, maxTransferConnections: null);
+        using var secondProvider = CreateClient(state, maxTransferConnections: null);
+        using var cts = new CancellationTokenSource();
+        using var healthContext = cts.Token.SetContext(
+            new HealthCheckAdmissionContext(gate, HealthCheckAdmissionPriority.Background));
+
+        var requests = StartStats(firstProvider, 2, cts.Token)
+            .Concat(StartStats(secondProvider, 2, cts.Token))
+            .ToArray();
+        await WaitForEnteredCount(state, expected: 1);
+
+        Assert.Equal(1, Volatile.Read(ref state.Entered));
+        Assert.Equal(1, firstProvider.LiveConnections + secondProvider.LiveConnections);
+        Assert.Equal(1, gate.GetSnapshot().Active);
+
+        state.ReleaseAll();
+        await Task.WhenAll(requests).WaitAsync(TestTimeout);
+        Assert.Equal(4, Volatile.Read(ref state.Entered));
+        Assert.Equal(0, gate.GetSnapshot().Active);
+    }
+
+    [Fact]
     public async Task NullTransferLimitPreservesLegacySharedPoolWidth()
     {
         var state = new BlockingStatState();
@@ -75,11 +109,12 @@ public class MultiConnectionConnectionBudgetTests
 
     private static Task<UsenetStatResponse>[] StartStats(
         MultiConnectionNntpClient client,
-        int count) =>
+        int count,
+        CancellationToken ct = default) =>
         Enumerable.Range(0, count)
             .Select(i => client.StatAsync(
                 new SegmentId($"segment-{i}"),
-                CancellationToken.None))
+                ct))
             .ToArray();
 
     private static async Task WaitForEnteredCount(BlockingStatState state, int expected)
