@@ -25,6 +25,23 @@ Background health monitoring, PAR2 reconstruction, and replacement of unhealthy 
 | Max missing data (% of file) | `repair.degraded-max-missing-byte-percent` | `1.0` | Tolerable hole share of file bytes (0.01–50) |
 | Library Directory | `media.library-dir` | empty | Organized library root in the container — parent of your Arr root folders. Never the rclone mount or `/completed-symlinks` |
 
+## Parallel health checks
+
+`repair.healthcheck-workers` controls how many library files can make progress at once.
+`repair.healthcheck-concurrency` remains the connection-pressure control, but is now shared by
+every background worker and queue article-existence validation. For example, four workers with a
+50-connection limit share those 50 admissions rather than receiving 50 each.
+
+Existing numeric `repair.healthcheck-concurrency` values remain valid during upgrades, including
+headless values outside the current effective range. InfiniDysk safely limits them at runtime to at
+least one, at most 200, and no more than the total pooled provider capacity. Existing Compose files
+therefore do not need to be changed before starting the new version.
+
+New background checks continue to wait while queue items are active. If queue work starts while a
+health check is already running, both paths share the aggregate admission limit and queue validation
+receives released capacity before waiting background verification. Repair and urgent-repair behavior
+inside each file check is otherwise unchanged.
+
 ## Re-check after provider changes [since 1.2.0](https://github.com/infinidysk/infinidysk/releases/tag/v1.2.0){ .nzbdav-since }
 
 Changing Usenet providers can affect which library files are available. After saving provider changes,
