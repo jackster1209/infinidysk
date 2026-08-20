@@ -295,15 +295,20 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         var fake = NewFakeClient(segments, missing: [50]);
         var (service, par2) = await NewServiceAsync(fake, par2Outcome: false);
         var queueActive = true;
+        var waitEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         service.CoordinatorPollInterval = TimeSpan.FromMilliseconds(10);
-        service.HasActiveQueueItemsOverride = () => queueActive;
+        service.HasActiveQueueItemsOverride = () =>
+        {
+            waitEntered.TrySetResult();
+            return queueActive;
+        };
 
         var healthCheck = service.PerformHealthCheck(
             item,
             _dbClient,
             concurrency: 4,
             CancellationToken.None);
-        await Task.Delay(100);
+        await waitEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
 
         Assert.False(healthCheck.IsCompleted);
         Assert.Empty(par2.Requests);
@@ -314,6 +319,34 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         Assert.Equal(
             HealthCheckResult.HealthResult.Unhealthy,
             Assert.Single(GetHealthRows(item.Id)).Result);
+    }
+
+    [Fact]
+    public async Task RoutineMissingArticle_DefersWhenQueueDoesNotBecomeIdle()
+    {
+        var segments = NewSegmentIds(HealthCheckService.SampleFloor + 1000);
+        var sizes = Enumerable.Repeat(100L, segments.Length).ToArray();
+        var (item, _) = await AddVideoFileAsync("movie.mkv", segments, sizes);
+        var fake = NewFakeClient(segments, missing: [50]);
+        var (service, par2) = await NewServiceAsync(fake, par2Outcome: false);
+        service.CoordinatorPollInterval = TimeSpan.FromMilliseconds(5);
+        service.RepairQueueIdleTimeout = TimeSpan.FromMilliseconds(30);
+        service.RepairQueueIdleLogInterval = TimeSpan.FromMilliseconds(10);
+        service.RepairQueueRetryDelay = TimeSpan.FromMinutes(2);
+        service.HasActiveQueueItemsOverride = () => true;
+
+        await service.PerformHealthCheck(
+            item,
+            _dbClient,
+            concurrency: 4,
+            CancellationToken.None);
+
+        Assert.Empty(par2.Requests);
+        var row = Assert.Single(GetHealthRows(item.Id));
+        Assert.Equal(HealthCheckResult.HealthResult.Unhealthy, row.Result);
+        Assert.Equal(HealthCheckResult.RepairAction.ActionNeeded, row.RepairStatus);
+        Assert.Contains("queue work remained active", row.Message);
+        Assert.True(ReloadItem(item.Id).NextHealthCheck > DateTimeOffset.UtcNow);
     }
 
     [Fact]

@@ -80,6 +80,9 @@ public class HealthCheckService : BackgroundService
     private static readonly ConcurrentDictionary<string, List<DateTimeOffset>> _recentRepairRemovalsByPath = new();
 
     internal TimeSpan CoordinatorPollInterval { get; set; } = TimeSpan.FromSeconds(1);
+    internal TimeSpan RepairQueueIdleTimeout { get; set; } = TimeSpan.FromMinutes(5);
+    internal TimeSpan RepairQueueIdleLogInterval { get; set; } = TimeSpan.FromMinutes(1);
+    internal TimeSpan RepairQueueRetryDelay { get; set; } = TimeSpan.FromMinutes(15);
     internal Func<DavDatabaseContext>? CreateDbContextOverride { get; set; }
     internal Func<HashSet<Guid>, bool, CancellationToken, Task<Guid?>>? SelectCandidateOverride
     { get; set; }
@@ -631,8 +634,11 @@ public class HealthCheckService : BackgroundService
                 }
             }
 
-            if (!isUrgentRepair)
-                await WaitForQueueIdleBeforeRepairAsync(davItem, ct).ConfigureAwait(false);
+            if (!await WaitForQueueIdleBeforeRepairAsync(davItem, ct).ConfigureAwait(false))
+            {
+                await DeferRepairForQueueActivityAsync(davItem, dbClient, ct).ConfigureAwait(false);
+                return;
+            }
 
             // when usenet article is missing, try PAR2 repair before Arr remove/re-grab
             if (_configManager.IsPar2RepairEnabled() && _configManager.IsPar2PreferredOverArr()
@@ -720,7 +726,11 @@ public class HealthCheckService : BackgroundService
         // PAR2 first, with the full hole list: reconstruct from parity before any verdict.
         if (_configManager.IsPar2RepairEnabled() && _configManager.IsPar2PreferredOverArr())
         {
-            await WaitForQueueIdleBeforeRepairAsync(davItem, ct).ConfigureAwait(false);
+            if (!await WaitForQueueIdleBeforeRepairAsync(davItem, ct).ConfigureAwait(false))
+            {
+                await DeferRepairForQueueActivityAsync(davItem, dbClient, ct).ConfigureAwait(false);
+                return;
+            }
             repairStarted = true;
             if (await _par2RepairService.TryPar2RepairAsync(davItem, holeSegmentIds, ct)
                     .ConfigureAwait(false))
@@ -775,7 +785,13 @@ public class HealthCheckService : BackgroundService
             if (FilenameUtil.IsImportantFileType(davItem.Name))
                 AddMissingSegmentIds(holeSegmentIds);
             if (!repairStarted)
-                await WaitForQueueIdleBeforeRepairAsync(davItem, ct).ConfigureAwait(false);
+            {
+                if (!await WaitForQueueIdleBeforeRepairAsync(davItem, ct).ConfigureAwait(false))
+                {
+                    await DeferRepairForQueueActivityAsync(davItem, dbClient, ct).ConfigureAwait(false);
+                    return;
+                }
+            }
             await Repair(davItem, dbClient, ct).ConfigureAwait(false);
             return;
         }
@@ -925,15 +941,59 @@ public class HealthCheckService : BackgroundService
         return true;
     }
 
-    private async Task WaitForQueueIdleBeforeRepairAsync(DavItem davItem, CancellationToken ct)
+    private async Task<bool> WaitForQueueIdleBeforeRepairAsync(DavItem davItem, CancellationToken ct)
     {
-        if (!HasActiveQueueItems) return;
+        if (!HasActiveQueueItems) return true;
 
         Log.Information(
             "Health repair for {Path} is waiting for active queue work to finish.",
             davItem.Path);
+        var deadline = DateTimeOffset.UtcNow + RepairQueueIdleTimeout;
+        var nextStatusLog = DateTimeOffset.UtcNow + RepairQueueIdleLogInterval;
         while (HasActiveQueueItems)
-            await Task.Delay(CoordinatorPollInterval, ct).ConfigureAwait(false);
+        {
+            var remaining = deadline - DateTimeOffset.UtcNow;
+            if (remaining <= TimeSpan.Zero) return false;
+
+            await Task.Delay(
+                    remaining < CoordinatorPollInterval ? remaining : CoordinatorPollInterval,
+                    ct)
+                .ConfigureAwait(false);
+            if (HasActiveQueueItems && DateTimeOffset.UtcNow >= nextStatusLog)
+            {
+                Log.Information(
+                    "Health repair for {Path} is still waiting for active queue work to finish.",
+                    davItem.Path);
+                nextStatusLog = DateTimeOffset.UtcNow + RepairQueueIdleLogInterval;
+            }
+        }
+
+        return true;
+    }
+
+    private async Task DeferRepairForQueueActivityAsync(
+        DavItem davItem,
+        DavDatabaseClient dbClient,
+        CancellationToken ct)
+    {
+        var utcNow = DateTimeOffset.UtcNow;
+        davItem.LastHealthCheck = utcNow;
+        davItem.NextHealthCheck = utcNow + RepairQueueRetryDelay;
+        Log.Warning(
+            "Health repair for {Path} was deferred because queue work remained active for {Timeout}. " +
+            "The item will be retried after {RetryDelay}.",
+            davItem.Path,
+            RepairQueueIdleTimeout,
+            RepairQueueRetryDelay);
+        await RecordHealthResult(
+                dbClient,
+                davItem,
+                HealthCheckResult.HealthResult.Unhealthy,
+                HealthCheckResult.RepairAction.ActionNeeded,
+                $"Repair deferred because queue work remained active for " +
+                $"{RepairQueueIdleTimeout.TotalMinutes:0.#} minutes.",
+                ct)
+            .ConfigureAwait(false);
     }
 
     private bool HasActiveQueueItems =>
