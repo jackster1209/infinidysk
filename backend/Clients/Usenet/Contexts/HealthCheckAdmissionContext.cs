@@ -4,4 +4,5 @@ namespace NzbWebDAV.Clients.Usenet.Contexts;
 
 public sealed record HealthCheckAdmissionContext(
     HealthCheckConnectionGate Gate,
-    HealthCheckAdmissionPriority Priority);
+    HealthCheckAdmissionPriority Priority,
+    bool GateLeasePreAcquired = false);
