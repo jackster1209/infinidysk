@@ -139,6 +139,23 @@ public sealed class HealthCheckStatSchedulerTests
     }
 
     [Fact]
+    public async Task RequestCancellation_DrainsAssignmentsAndReleasesEveryGateLease()
+    {
+        await using var harness = await SchedulerHarness.CreateAsync(limit: 4);
+        var session = harness.StartSession(segmentCount: 20);
+        await WaitUntilAsync(() => harness.Scheduler.GetSnapshot().ActiveAssignments == 4);
+
+        await session.CancelAsync();
+        await WaitUntilAsync(() => harness.Scheduler.GetSnapshot().ActiveAssignments == 0);
+
+        var snapshot = harness.Scheduler.GetSnapshot();
+        Assert.Equal(1, snapshot.Cancellations);
+        Assert.Equal(0, snapshot.Failures);
+        Assert.Empty(snapshot.Sessions);
+        Assert.Equal(0, harness.Gate.GetSnapshot().Active);
+    }
+
+    [Fact]
     public async Task CollectMissing_ReturnsInputIndicesInOrder()
     {
         await using var harness = await SchedulerHarness.CreateAsync(limit: 4);

@@ -275,7 +275,19 @@ public sealed class HealthCheckStatScheduler : BackgroundService
         {
             if (finished.Exception is not null)
             {
-                FailSession(session, finished.Exception);
+                if (finished.Exception is OperationCanceledException
+                    && (session.RequestCancellationToken.IsCancellationRequested || _shuttingDown))
+                {
+                    session.Status = SessionStatus.Cancelling;
+                    session.CancellationToken = session.RequestCancellationToken.IsCancellationRequested
+                        ? session.RequestCancellationToken
+                        : _stoppingToken;
+                    session.Cancellation.Cancel();
+                }
+                else
+                {
+                    FailSession(session, finished.Exception);
+                }
             }
             else if (finished.Response is { } response)
             {
@@ -452,10 +464,12 @@ public sealed class HealthCheckStatScheduler : BackgroundService
         }
         finally
         {
+            // Publish completion before releasing the gate lease. A release may synchronously
+            // grant the next anonymous admission; channel ordering must let the actor remove this
+            // assignment before it binds that newly executable slot to another session.
+            _events.Writer.TryWrite(new AssignmentFinished(assignment, response, exception));
             assignment.Lease.Dispose();
         }
-
-        _events.Writer.TryWrite(new AssignmentFinished(assignment, response, exception));
     }
 
     private void BeginShutdown()
