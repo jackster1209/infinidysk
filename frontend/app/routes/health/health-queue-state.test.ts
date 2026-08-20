@@ -17,7 +17,6 @@ function queueItem(id: string, nextHealthCheck: string | null): HealthCheckQueue
         releaseDate: null,
         lastHealthCheck: null,
         nextHealthCheck,
-        progress: 0,
     };
 }
 
@@ -117,7 +116,7 @@ describe("health websocket payload parsing", () => {
 });
 
 describe("getVisibleHealthCheckItems", () => {
-    it("surfaces progressing checks ahead of the visible waiting rows", () => {
+    it("surfaces progressing checks while retaining API rows without progress", () => {
         const items = Array.from({ length: 12 }, (_, index) => queueItem(`item-${index}`, null));
         items[11] = { ...items[11]!, progress: 35 };
 
