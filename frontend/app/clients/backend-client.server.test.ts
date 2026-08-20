@@ -154,14 +154,23 @@ describe("BackendClient", () => {
     expect((init?.body as FormData).get("nzbFile")).toBeInstanceOf(File);
   });
 
-  it("gets health queue and filtered paginated history", async () => {
+  it("gets health queue, verification load, and filtered paginated history", async () => {
     const queue = { uncheckedCount: 0, items: [] };
+    const gate = {
+      limit: 50,
+      active: 20,
+      peakActive: 45,
+      waitingBackground: 30,
+      peakWaitingBackground: 80,
+    };
     const history = { stats: [], items: [], totalCount: 0 };
     fetchMock
       .mockResolvedValueOnce(jsonResponse(queue))
+      .mockResolvedValueOnce(jsonResponse(gate))
       .mockResolvedValueOnce(jsonResponse(history));
 
     await expect(backendClient.getHealthCheckQueue(30)).resolves.toEqual(queue);
+    await expect(backendClient.getHealthCheckGate()).resolves.toEqual(gate);
     await expect(
       backendClient.getHealthCheckHistory({
         page: 2,
@@ -171,6 +180,7 @@ describe("BackendClient", () => {
     ).resolves.toEqual(history);
     expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
       "http://backend/api/get-health-check-queue?pageSize=30",
+      "http://backend/api/get-health-check-gate",
       "http://backend/api/get-health-check-history?page=2&pageSize=25&repairStatus=deleted%2Crepaired",
     ]);
   });

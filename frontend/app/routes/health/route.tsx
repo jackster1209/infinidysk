@@ -11,6 +11,7 @@ import { useRevalidator, useSearchParams } from "react-router";
 import { useWebsocketTopics } from "~/utils/shared-websocket";
 import { Alert, Icon } from "~/components/ui";
 import type {
+  HealthCheckGateSnapshot,
   HealthCheckQueueResponse,
   HealthResult,
   RepairAction,
@@ -36,6 +37,7 @@ const topicSubscriptions = {
 
 const PAGE_SIZE_OPTIONS = [25, 50, 100, 250] as const;
 const DEFAULT_PAGE_SIZE = 25;
+const VERIFICATION_LOAD_REFRESH_MS = 5_000;
 
 function parsePage(value: string | null): number {
   const page = parseInt(value ?? "1", 10);
@@ -66,8 +68,9 @@ export async function loader({ request }: Route.LoaderArgs) {
         ? undefined
         : historyFilter;
   const result = historyFilter === "degraded" ? "degraded" : undefined;
-  const [queueData, historyData, config] = await Promise.all([
+    const [queueData, verificationLoad, historyData, config] = await Promise.all([
     backendClient.getHealthCheckQueue(30),
+        backendClient.getHealthCheckGate(),
     backendClient.getHealthCheckHistory({
       page: historyPage,
       pageSize: historyPageSize,
@@ -80,6 +83,7 @@ export async function loader({ request }: Route.LoaderArgs) {
   return {
     uncheckedCount: queueData.uncheckedCount,
     queueItems: queueData.items,
+        verificationLoad,
     historyStats: historyData.stats,
     historyItems: historyData.items,
     historyTotalCount: historyData.totalCount,
@@ -102,6 +106,7 @@ export default function Health({ loaderData }: Route.ComponentProps) {
     items: loaderData.queueItems,
     uncheckedCount: loaderData.uncheckedCount,
   });
+  const [verificationLoad, setVerificationLoad] = useState(loaderData.verificationLoad);
   const { items: queueItems, uncheckedCount } = queueState;
   const [, setSearchParams] = useSearchParams();
   const revalidator = useRevalidator();
@@ -115,6 +120,9 @@ export default function Health({ loaderData }: Route.ComponentProps) {
   useEffect(() => {
     setHistoryTotalCount(loaderData.historyTotalCount);
   }, [loaderData.historyTotalCount]);
+  useEffect(() => {
+    setVerificationLoad(loaderData.verificationLoad);
+  }, [loaderData.verificationLoad]);
   useEffect(() => {
     setQueueState({
       items: loaderData.queueItems,
@@ -171,6 +179,31 @@ export default function Health({ loaderData }: Route.ComponentProps) {
     };
     void refetchData(); // fire-and-forget queue refill
   }, [queueItems, setQueueState]);
+
+    useEffect(() => {
+        if (!isEnabled) return;
+        const controller = new AbortController();
+        const refreshVerificationLoad = async () => {
+            try {
+                const response = await fetch(withUrlBase('/api/get-health-check-gate'), {
+                    signal: controller.signal,
+                });
+                if (response.ok) {
+                    setVerificationLoad(await response.json() as HealthCheckGateSnapshot);
+                }
+            } catch {
+                // Preserve the last snapshot across a transient refresh failure.
+            }
+        };
+        const interval = window.setInterval(
+            () => void refreshVerificationLoad(),
+            VERIFICATION_LOAD_REFRESH_MS,
+        );
+        return () => {
+            window.clearInterval(interval);
+            controller.abort();
+        };
+    }, [isEnabled]);
 
   // events
   const onHealthItemStatus = useCallback(
@@ -269,6 +302,7 @@ export default function Health({ loaderData }: Route.ComponentProps) {
       <HealthTable
         isEnabled={isEnabled}
         healthCheckItems={getVisibleHealthCheckItems(queueItems)}
+        verificationLoad={verificationLoad}
       />
     </div>
   );

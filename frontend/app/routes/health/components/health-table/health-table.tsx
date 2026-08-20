@@ -1,10 +1,14 @@
-import type { HealthCheckQueueItem } from "~/clients/backend-client.server";
+import type {
+  HealthCheckGateSnapshot,
+  HealthCheckQueueItem,
+} from "~/clients/backend-client.server";
 import { Truncate } from "~/components/truncate/truncate";
 import { Badge, Icon } from "~/components/ui";
 
 export type HealthTableProps = {
   isEnabled: boolean;
   healthCheckItems: HealthCheckQueueItem[];
+  verificationLoad: HealthCheckGateSnapshot;
 };
 
 const desktopHeaderClass =
@@ -12,7 +16,7 @@ const desktopHeaderClass =
 const desktopCellClass =
   "hidden min-[900px]:table-cell max-w-[160px] whitespace-nowrap px-1 py-3 text-center align-middle font-mono text-xs tabular-nums text-base-content/70";
 
-export function HealthTable({ isEnabled, healthCheckItems }: HealthTableProps) {
+export function HealthTable({ isEnabled, healthCheckItems, verificationLoad }: HealthTableProps) {
   return (
     <section className="card w-full border border-base-content/10 bg-base-100 shadow-sm">
       <div className="card-body gap-0 p-0">
@@ -24,6 +28,8 @@ export function HealthTable({ isEnabled, healthCheckItems }: HealthTableProps) {
             </Badge>
           )}
         </div>
+
+                {isEnabled && <VerificationLoad snapshot={verificationLoad} />}
 
         {!isEnabled ? (
           <EmptyState
@@ -97,6 +103,50 @@ export function HealthTable({ isEnabled, healthCheckItems }: HealthTableProps) {
       </div>
     </section>
   );
+}
+
+function VerificationLoad({ snapshot }: { snapshot: HealthCheckGateSnapshot }) {
+    const utilization = snapshot.limit > 0
+        ? Math.min(100, Math.round((snapshot.active / snapshot.limit) * 100))
+        : 0;
+
+    return (
+        <div className="grid gap-4 border-b border-base-content/10 bg-base-200/30 px-4 py-3 md:grid-cols-[minmax(220px,1fr)_auto_auto] md:items-center md:px-6">
+            <div className="min-w-0">
+                <div className="mb-1.5 flex items-center justify-between gap-3 text-xs">
+                    <span className="inline-flex items-center gap-1.5 font-semibold text-base-content/70">
+                        <Icon name="speed" className="!text-[16px] text-base-content/50" />
+                        Verification load
+                    </span>
+                    <span className="font-mono tabular-nums text-base-content/70">
+                        {snapshot.active} / {snapshot.limit} active
+                    </span>
+                </div>
+                <progress
+                    aria-label="Active health-check verification connections"
+                    className="progress progress-info h-1.5 w-full"
+                    value={utilization}
+                    max={100}
+                />
+            </div>
+            <LoadValue label="Recent active peak" value={`${snapshot.peakActive} / ${snapshot.limit}`} />
+            <LoadValue
+                label="Background waiting"
+                value={snapshot.waitingBackground.toLocaleString()}
+                detail={`Recent peak ${snapshot.peakWaitingBackground.toLocaleString()}`}
+            />
+        </div>
+    );
+}
+
+function LoadValue({ label, value, detail }: { label: string; value: string; detail?: string }) {
+    return (
+        <div className="flex items-baseline justify-between gap-4 md:min-w-[130px] md:flex-col md:items-start md:gap-0">
+            <span className="text-[11px] uppercase tracking-wide text-base-content/45">{label}</span>
+            <span className="font-mono text-sm font-semibold tabular-nums text-base-content/80">{value}</span>
+            {detail && <span className="text-[11px] text-base-content/45">{detail}</span>}
+        </div>
+    );
 }
 
 function EmptyState({ title, body }: { title: string; body: string }) {

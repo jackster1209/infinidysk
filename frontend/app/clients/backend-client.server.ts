@@ -449,6 +449,12 @@ class BackendClient {
     );
   }
 
+    public async getHealthCheckGate(): Promise<HealthCheckGateSnapshot> {
+        return await call<HealthCheckGateSnapshot>("/api/get-health-check-gate", "Failed to get health check verification load", {
+            method: "GET",
+        });
+    }
+
   public async getWatchdogEntries(limit: number = 200): Promise<WatchdogEntry[]> {
     const data = await call<{ entries?: WatchdogEntry[] }>(
       `${adminApi.getWatchdogEntries}?limit=${limit}`,
@@ -865,6 +871,14 @@ export type HealthCheckQueueResponse = {
   uncheckedCount: number;
   items: HealthCheckQueueItem[];
 };
+
+export type HealthCheckGateSnapshot = {
+    limit: number,
+    active: number,
+    peakActive: number,
+    waitingBackground: number,
+    peakWaitingBackground: number,
+}
 
 export type HealthCheckQueueItem = {
   id: string;

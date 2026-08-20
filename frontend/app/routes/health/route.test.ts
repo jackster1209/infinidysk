@@ -1,8 +1,14 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { loader } from "./route";
 
-const { getConfigMock, getHealthCheckHistoryMock, getHealthCheckQueueMock } = vi.hoisted(() => ({
+const {
+  getConfigMock,
+  getHealthCheckGateMock,
+  getHealthCheckHistoryMock,
+  getHealthCheckQueueMock,
+} = vi.hoisted(() => ({
   getConfigMock: vi.fn(),
+  getHealthCheckGateMock: vi.fn(),
   getHealthCheckHistoryMock: vi.fn(),
   getHealthCheckQueueMock: vi.fn(),
 }));
@@ -10,6 +16,7 @@ const { getConfigMock, getHealthCheckHistoryMock, getHealthCheckQueueMock } = vi
 vi.mock("~/clients/backend-client.server", () => ({
   backendClient: {
     getConfig: getConfigMock,
+    getHealthCheckGate: getHealthCheckGateMock,
     getHealthCheckHistory: getHealthCheckHistoryMock,
     getHealthCheckQueue: getHealthCheckQueueMock,
   },
@@ -45,6 +52,14 @@ function loaderArgs(path = "/health") {
 describe("health route loader", () => {
   beforeEach(() => {
     getConfigMock.mockReset();
+    getHealthCheckGateMock.mockReset();
+    getHealthCheckGateMock.mockResolvedValue({
+      limit: 50,
+      active: 0,
+      peakActive: 0,
+      waitingBackground: 0,
+      peakWaitingBackground: 0,
+    });
     getHealthCheckHistoryMock.mockReset();
     getHealthCheckQueueMock.mockReset();
   });
@@ -53,6 +68,13 @@ describe("health route loader", () => {
     const queueItems = [{ id: "queue-1", name: "Example" }];
     const historyStats = [{ result: 0, repairStatus: 0, count: 4 }];
     const historyItems = [{ id: "history-1", path: "/view/example.mkv" }];
+    const verificationLoad = {
+      limit: 50,
+      active: 18,
+      peakActive: 40,
+      waitingBackground: 12,
+      peakWaitingBackground: 30,
+    };
     getHealthCheckQueueMock.mockResolvedValueOnce({
       uncheckedCount: 12,
       items: queueItems,
@@ -62,11 +84,15 @@ describe("health route loader", () => {
       items: historyItems,
       totalCount: 1,
     });
-    getConfigMock.mockResolvedValueOnce([{ configName: "repair.enable", configValue: "TRUE" }]);
+    getHealthCheckGateMock.mockResolvedValueOnce(verificationLoad);
+    getConfigMock.mockResolvedValueOnce([
+      { configName: "repair.enable", configValue: "TRUE" },
+    ]);
 
     await expect(loader(loaderArgs())).resolves.toEqual({
       uncheckedCount: 12,
       queueItems,
+      verificationLoad,
       historyStats,
       historyItems,
       historyTotalCount: 1,
@@ -76,6 +102,7 @@ describe("health route loader", () => {
       isEnabled: true,
     });
     expect(getHealthCheckQueueMock).toHaveBeenCalledWith(30);
+    expect(getHealthCheckGateMock).toHaveBeenCalledOnce();
     expect(getHealthCheckHistoryMock).toHaveBeenCalledWith({
       page: 1,
       pageSize: 25,
