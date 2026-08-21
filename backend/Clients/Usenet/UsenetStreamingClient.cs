@@ -206,6 +206,7 @@ public class UsenetStreamingClient : WrappingNntpClient
             .Select((provider, index) => CreateProviderClient(
                 provider,
                 connectionPoolStats.GetOnConnectionPoolChanged(index),
+                connectionPoolStats.GetOnConnectionAdmissionChanged(index),
                 idleTimeoutSeconds,
                 configManager.IsWarmConnectionsEnabled()
                     ? configManager.GetWarmConnectionsFloor(provider.MaxConnections)
@@ -231,6 +232,7 @@ public class UsenetStreamingClient : WrappingNntpClient
     (
         UsenetProviderConfig.ConnectionDetails connectionDetails,
         EventHandler<ConnectionPoolStats.ConnectionPoolChangedEventArgs> onConnectionPoolChanged,
+        Action<ProviderConnectionAdmissionSnapshot> onConnectionAdmissionChanged,
         int idleTimeoutSeconds,
         int warmConnectionFloor,
         MetricsWriter metricsWriter,
@@ -339,7 +341,8 @@ public class UsenetStreamingClient : WrappingNntpClient
             metricsKey,
             latencyTracker,
             connectionDetails.MaxTransferConnections,
-            streamingPriority
+            streamingPriority,
+            onConnectionAdmissionChanged
         );
     }
 

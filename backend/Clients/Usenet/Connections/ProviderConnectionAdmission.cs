@@ -17,6 +17,7 @@ internal sealed class ProviderConnectionAdmission : IDisposable
 {
     private readonly Func<int> _getEffectiveProviderLimit;
     private readonly int _configuredTransferLimit;
+    private readonly Action<ProviderConnectionAdmissionSnapshot>? _onChanged;
     private readonly Lock _lock = new();
     private readonly LinkedList<Waiter> _transferHighWaiters = [];
     private readonly LinkedList<Waiter> _transferLowWaiters = [];
@@ -42,13 +43,15 @@ internal sealed class ProviderConnectionAdmission : IDisposable
     public ProviderConnectionAdmission(
         Func<int> getEffectiveProviderLimit,
         int configuredTransferLimit,
-        SemaphorePriorityOdds? priorityOdds = null)
+        SemaphorePriorityOdds? priorityOdds = null,
+        Action<ProviderConnectionAdmissionSnapshot>? onChanged = null)
     {
         _getEffectiveProviderLimit = getEffectiveProviderLimit
             ?? throw new ArgumentNullException(nameof(getEffectiveProviderLimit));
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(configuredTransferLimit);
         _configuredTransferLimit = configuredTransferLimit;
         _priorityOdds = priorityOdds ?? new SemaphorePriorityOdds { HighPriorityOdds = 100 };
+        _onChanged = onChanged;
     }
 
     public Task<Lease> AcquireAsync(
@@ -100,21 +103,7 @@ internal sealed class ProviderConnectionAdmission : IDisposable
     public ProviderConnectionAdmissionSnapshot GetSnapshot()
     {
         lock (_lock)
-        {
-            var budget = ProviderConnectionBudget.Calculate(
-                _getEffectiveProviderLimit(),
-                _configuredTransferLimit);
-            return new ProviderConnectionAdmissionSnapshot(
-                _configuredTransferLimit,
-                budget.EffectiveTransferLimit,
-                budget.BaseMetadataCapacity,
-                budget.MetadataBurstAllowance,
-                budget.MaxMetadataCapacity,
-                _activeTransfers,
-                _activeMetadata,
-                _transferHighWaiters.Count + _transferLowWaiters.Count,
-                _metadataHighWaiters.Count + _metadataLowWaiters.Count);
-        }
+            return CreateSnapshotUnsafe();
     }
 
     private bool CanEnterImmediately(ProviderConnectionKind kind)
@@ -154,6 +143,7 @@ internal sealed class ProviderConnectionAdmission : IDisposable
             _activeTransfers++;
         else
             _activeMetadata++;
+        NotifyChangedUnsafe();
     }
 
     private void Release(ProviderConnectionKind kind)
@@ -166,6 +156,7 @@ internal sealed class ProviderConnectionAdmission : IDisposable
             else
                 _activeMetadata--;
 
+            NotifyChangedUnsafe();
             if (_disposed) return;
             ready = DispatchWaiters();
         }
@@ -261,6 +252,25 @@ internal sealed class ProviderConnectionAdmission : IDisposable
     private bool HasWaiters(ProviderConnectionKind kind) =>
         GetQueue(kind, SemaphorePriority.High).Count > 0
         || GetQueue(kind, SemaphorePriority.Low).Count > 0;
+
+    private ProviderConnectionAdmissionSnapshot CreateSnapshotUnsafe()
+    {
+        var budget = ProviderConnectionBudget.Calculate(
+            _getEffectiveProviderLimit(),
+            _configuredTransferLimit);
+        return new ProviderConnectionAdmissionSnapshot(
+            _configuredTransferLimit,
+            budget.EffectiveTransferLimit,
+            budget.BaseMetadataCapacity,
+            budget.MetadataBurstAllowance,
+            budget.MaxMetadataCapacity,
+            _activeTransfers,
+            _activeMetadata,
+            _transferHighWaiters.Count + _transferLowWaiters.Count,
+            _metadataHighWaiters.Count + _metadataLowWaiters.Count);
+    }
+
+    private void NotifyChangedUnsafe() => _onChanged?.Invoke(CreateSnapshotUnsafe());
 
     private LinkedList<Waiter> GetQueue(
         ProviderConnectionKind kind,

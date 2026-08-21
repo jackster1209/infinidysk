@@ -17,7 +17,9 @@ public class ConnectionPoolStats
     private readonly int[] _latestLive;
     private readonly int[] _latestIdle;
     private readonly int[] _latestMax;
+    private readonly ProviderConnectionAdmissionSnapshot?[] _latestAdmission;
     private readonly bool[] _dirty;
+    private readonly bool _splitSummaryEnabled;
     private int _totalLive;
     private int _totalIdle;
     private int _totalMax;
@@ -42,6 +44,7 @@ public class ConnectionPoolStats
         _latestLive = new int[count];
         _latestIdle = new int[count];
         _latestMax = new int[count];
+        _latestAdmission = new ProviderConnectionAdmissionSnapshot?[count];
         _dirty = new bool[count];
 
         // Initialize from config so the header shows the configured ceiling before
@@ -52,6 +55,12 @@ public class ConnectionPoolStats
             .Where(x => x.Type == ProviderType.Pooled)
             .Select(x => x.MaxConnections)
             .Sum();
+        var enabledProviders = providerConfig.Providers
+            .Where(provider => provider.Type != ProviderType.Disabled)
+            .ToArray();
+        _splitSummaryEnabled = enabledProviders.Length > 0
+                               && enabledProviders.All(provider =>
+                                   provider.MaxTransferConnections.HasValue);
 
         _providerConfig = providerConfig;
         _websocketManager = websocketManager;
@@ -88,9 +97,38 @@ public class ConnectionPoolStats
                 }
             }
 
-            if (Interlocked.CompareExchange(ref _flushScheduled, 1, 0) == 0)
-                _ = FlushAfterDelayAsync();
+            ScheduleFlush();
         }
+    }
+
+    public Action<ProviderConnectionAdmissionSnapshot> GetOnConnectionAdmissionChanged(
+        int providerIndex)
+    {
+        return OnChanged;
+
+        void OnChanged(ProviderConnectionAdmissionSnapshot snapshot)
+        {
+            if (!_splitSummaryEnabled)
+                return;
+            if (Volatile.Read(ref _active) == 0)
+                return;
+
+            lock (_lock)
+            {
+                if (_active == 0)
+                    return;
+                _latestAdmission[providerIndex] = snapshot;
+                _dirty[providerIndex] = true;
+            }
+
+            ScheduleFlush();
+        }
+    }
+
+    private void ScheduleFlush()
+    {
+        if (Interlocked.CompareExchange(ref _flushScheduled, 1, 0) == 0)
+            _ = FlushAfterDelayAsync();
     }
 
     private async Task FlushAfterDelayAsync()
@@ -120,9 +158,47 @@ public class ConnectionPoolStats
                 _dirty[i] = false;
                 var message =
                     $"{i}|{_latestLive[i]}|{_latestIdle[i]}|{_totalLive}|{_totalMax}|{_totalIdle}";
+                if (_splitSummaryEnabled)
+                {
+                    var summary = CreateSplitSummary();
+                    message +=
+                        $"|1|{summary.ActiveTransfers}|{summary.TransferLimit}" +
+                        $"|{summary.ActiveMetadata}|{summary.MetadataBase}|{summary.MetadataMax}";
+                }
                 _ = _websocketManager.SendMessage(WebsocketTopic.UsenetConnections, message);
             }
         }
+    }
+
+    private SplitConnectionSummary CreateSplitSummary()
+    {
+        var activeTransfers = 0;
+        var transferLimit = 0;
+        var activeMetadata = 0;
+        var metadataBase = 0;
+        var metadataMax = 0;
+        for (var i = 0; i < _providerConfig.Providers.Count; i++)
+        {
+            var provider = _providerConfig.Providers[i];
+            if (provider.Type == ProviderType.Disabled) continue;
+
+            var admission = _latestAdmission[i];
+            var budget = ProviderConnectionBudget.Calculate(
+                _latestMax[i],
+                provider.MaxTransferConnections!.Value);
+            activeTransfers += admission?.ActiveTransferOperations ?? 0;
+            transferLimit += budget.EffectiveTransferLimit;
+            activeMetadata += admission?.ActiveMetadataOperations ?? 0;
+            metadataBase += budget.BaseMetadataCapacity;
+            metadataMax += budget.MaxMetadataCapacity;
+        }
+
+        return new SplitConnectionSummary(
+            activeTransfers,
+            transferLimit,
+            activeMetadata,
+            metadataBase,
+            metadataMax);
     }
 
     /// <summary>
@@ -145,4 +221,11 @@ public class ConnectionPoolStats
         public int Max { get; } = max;
         public int Active => Live - Idle;
     }
+
+    private sealed record SplitConnectionSummary(
+        int ActiveTransfers,
+        int TransferLimit,
+        int ActiveMetadata,
+        int MetadataBase,
+        int MetadataMax);
 }
