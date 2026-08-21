@@ -59,6 +59,18 @@ describe("health route loader", () => {
       peakActive: 0,
       waitingBackground: 0,
       peakWaitingBackground: 0,
+      scheduler: {
+        capacity: 50,
+        activeAssignments: 0,
+        pendingAdmissions: 0,
+        runnableSessions: 0,
+        pendingSegments: 0,
+        dispatches: 0,
+        completions: 0,
+        cancellations: 0,
+        failures: 0,
+        sessions: [],
+      },
     });
     getHealthCheckHistoryMock.mockReset();
     getHealthCheckQueueMock.mockReset();
@@ -74,6 +86,18 @@ describe("health route loader", () => {
       peakActive: 40,
       waitingBackground: 12,
       peakWaitingBackground: 30,
+      scheduler: {
+        capacity: 50,
+        activeAssignments: 0,
+        pendingAdmissions: 0,
+        runnableSessions: 0,
+        pendingSegments: 0,
+        dispatches: 0,
+        completions: 0,
+        cancellations: 0,
+        failures: 0,
+        sessions: [],
+      },
     };
     getHealthCheckQueueMock.mockResolvedValueOnce({
       uncheckedCount: 12,
