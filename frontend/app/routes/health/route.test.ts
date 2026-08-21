@@ -85,9 +85,7 @@ describe("health route loader", () => {
       totalCount: 1,
     });
     getHealthCheckGateMock.mockResolvedValueOnce(verificationLoad);
-    getConfigMock.mockResolvedValueOnce([
-      { configName: "repair.enable", configValue: "TRUE" },
-    ]);
+    getConfigMock.mockResolvedValueOnce([{ configName: "repair.enable", configValue: "TRUE" }]);
 
     await expect(loader(loaderArgs())).resolves.toEqual({
       uncheckedCount: 12,

@@ -68,9 +68,9 @@ export async function loader({ request }: Route.LoaderArgs) {
         ? undefined
         : historyFilter;
   const result = historyFilter === "degraded" ? "degraded" : undefined;
-    const [queueData, verificationLoad, historyData, config] = await Promise.all([
+  const [queueData, verificationLoad, historyData, config] = await Promise.all([
     backendClient.getHealthCheckQueue(30),
-        backendClient.getHealthCheckGate(),
+    backendClient.getHealthCheckGate(),
     backendClient.getHealthCheckHistory({
       page: historyPage,
       pageSize: historyPageSize,
@@ -83,7 +83,7 @@ export async function loader({ request }: Route.LoaderArgs) {
   return {
     uncheckedCount: queueData.uncheckedCount,
     queueItems: queueData.items,
-        verificationLoad,
+    verificationLoad,
     historyStats: historyData.stats,
     historyItems: historyData.items,
     historyTotalCount: historyData.totalCount,
@@ -180,30 +180,30 @@ export default function Health({ loaderData }: Route.ComponentProps) {
     void refetchData(); // fire-and-forget queue refill
   }, [queueItems, setQueueState]);
 
-    useEffect(() => {
-        if (!isEnabled) return;
-        const controller = new AbortController();
-        const refreshVerificationLoad = async () => {
-            try {
-                const response = await fetch(withUrlBase('/api/get-health-check-gate'), {
-                    signal: controller.signal,
-                });
-                if (response.ok) {
-                    setVerificationLoad(await response.json() as HealthCheckGateSnapshot);
-                }
-            } catch {
-                // Preserve the last snapshot across a transient refresh failure.
-            }
-        };
-        const interval = window.setInterval(
-            () => void refreshVerificationLoad(),
-            VERIFICATION_LOAD_REFRESH_MS,
-        );
-        return () => {
-            window.clearInterval(interval);
-            controller.abort();
-        };
-    }, [isEnabled]);
+  useEffect(() => {
+    if (!isEnabled) return;
+    const controller = new AbortController();
+    const refreshVerificationLoad = async () => {
+      try {
+        const response = await fetch(withUrlBase("/api/get-health-check-gate"), {
+          signal: controller.signal,
+        });
+        if (response.ok) {
+          setVerificationLoad((await response.json()) as HealthCheckGateSnapshot);
+        }
+      } catch {
+        // Preserve the last snapshot across a transient refresh failure.
+      }
+    };
+    const interval = window.setInterval(
+      () => void refreshVerificationLoad(),
+      VERIFICATION_LOAD_REFRESH_MS,
+    );
+    return () => {
+      window.clearInterval(interval);
+      controller.abort();
+    };
+  }, [isEnabled]);
 
   // events
   const onHealthItemStatus = useCallback(
@@ -250,11 +250,7 @@ export default function Health({ loaderData }: Route.ComponentProps) {
       const progressUpdate = parseHealthItemProgressMessage(message);
       if (!progressUpdate) return;
       setQueueState((queueState) =>
-        updateHealthCheckProgress(
-          queueState,
-          progressUpdate.davItemId,
-          progressUpdate.progress,
-        ),
+        updateHealthCheckProgress(queueState, progressUpdate.davItemId, progressUpdate.progress),
       );
     },
     [setQueueState],
