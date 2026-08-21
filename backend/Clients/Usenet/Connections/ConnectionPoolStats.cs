@@ -180,7 +180,7 @@ public class ConnectionPoolStats
         for (var i = 0; i < _providerConfig.Providers.Count; i++)
         {
             var provider = _providerConfig.Providers[i];
-            if (provider.Type == ProviderType.Disabled) continue;
+            if (provider.Type != ProviderType.Pooled) continue;
 
             var admission = _latestAdmission[i];
             var budget = ProviderConnectionBudget.Calculate(
