@@ -1,3 +1,5 @@
+// Client-side preview of the budget formula in
+// backend/Clients/Usenet/Connections/ProviderConnectionBudget.cs — keep both in sync.
 export type ProviderConnectionBudgetPreview = Readonly<{
   providerLimit: number;
   transferLimit: number;

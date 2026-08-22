@@ -922,6 +922,8 @@ public class MultiConnectionNntpClient(
         return connectionLock;
     }
 
+    // Admission is a pool-wait latency marker, not a real NNTP command — it falls
+    // through to Metadata intentionally so it never consumes a transfer slot.
     internal static ProviderConnectionKind ClassifyConnectionKind(NntpOperation operation) =>
         operation is NntpOperation.Body
             or NntpOperation.Article

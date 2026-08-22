@@ -61,6 +61,7 @@ internal sealed class ProviderConnectionAdmission : IDisposable
     {
         cancellationToken.ThrowIfCancellationRequested();
 
+        ProviderConnectionAdmissionSnapshot? snapshot;
         lock (_lock)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
@@ -68,26 +69,32 @@ internal sealed class ProviderConnectionAdmission : IDisposable
             if (CanEnterImmediately(kind))
             {
                 Enter(kind);
-                return Task.FromResult(new Lease(this, kind));
+                snapshot = CreateSnapshotUnsafe();
             }
-
-            var waiter = new Waiter(kind, priority);
-            GetQueue(kind, priority).AddLast(waiter);
-
-            if (cancellationToken.CanBeCanceled)
+            else
             {
-                var registration = cancellationToken.Register(
-                    () => CancelWaiter(waiter, cancellationToken));
-                _ = waiter.Completion.Task.ContinueWith(
-                    static (_, state) => ((CancellationTokenRegistration)state!).Dispose(),
-                    registration,
-                    CancellationToken.None,
-                    TaskContinuationOptions.None,
-                    TaskScheduler.Default);
-            }
+                snapshot = null;
+                var waiter = new Waiter(kind, priority);
+                GetQueue(kind, priority).AddLast(waiter);
 
-            return waiter.Completion.Task;
+                if (cancellationToken.CanBeCanceled)
+                {
+                    var registration = cancellationToken.Register(
+                        () => CancelWaiter(waiter, cancellationToken));
+                    _ = waiter.Completion.Task.ContinueWith(
+                        static (_, state) => ((CancellationTokenRegistration)state!).Dispose(),
+                        registration,
+                        CancellationToken.None,
+                        TaskContinuationOptions.None,
+                        TaskScheduler.Default);
+                }
+
+                return waiter.Completion.Task;
+            }
         }
+
+        NotifyChanged(snapshot);
+        return Task.FromResult(new Lease(this, kind));
     }
 
     public void UpdatePriorityOdds(SemaphorePriorityOdds priorityOdds)
@@ -143,12 +150,12 @@ internal sealed class ProviderConnectionAdmission : IDisposable
             _activeTransfers++;
         else
             _activeMetadata++;
-        NotifyChangedUnsafe();
     }
 
     private void Release(ProviderConnectionKind kind)
     {
         List<(TaskCompletionSource<Lease> Completion, Lease Lease)> ready;
+        ProviderConnectionAdmissionSnapshot? snapshot;
         lock (_lock)
         {
             if (kind == ProviderConnectionKind.Transfer)
@@ -156,26 +163,38 @@ internal sealed class ProviderConnectionAdmission : IDisposable
             else
                 _activeMetadata--;
 
-            NotifyChangedUnsafe();
             if (_disposed) return;
             ready = DispatchWaiters();
+            snapshot = CreateSnapshotUnsafe();
         }
 
+        NotifyChanged(snapshot);
         CompleteReadyWaiters(ready);
     }
 
     private void CancelWaiter(Waiter waiter, CancellationToken cancellationToken)
     {
         List<(TaskCompletionSource<Lease> Completion, Lease Lease)> ready;
+        ProviderConnectionAdmissionSnapshot? snapshot;
         var removed = false;
         lock (_lock)
         {
             removed = GetQueue(waiter.Kind, waiter.Priority).Remove(waiter);
-            ready = removed && !_disposed ? DispatchWaiters() : [];
+            if (removed && !_disposed)
+            {
+                ready = DispatchWaiters();
+                snapshot = CreateSnapshotUnsafe();
+            }
+            else
+            {
+                ready = [];
+                snapshot = null;
+            }
         }
 
         if (removed)
             waiter.Completion.TrySetCanceled(cancellationToken);
+        NotifyChanged(snapshot);
         CompleteReadyWaiters(ready);
     }
 
@@ -270,7 +289,11 @@ internal sealed class ProviderConnectionAdmission : IDisposable
             _metadataHighWaiters.Count + _metadataLowWaiters.Count);
     }
 
-    private void NotifyChangedUnsafe() => _onChanged?.Invoke(CreateSnapshotUnsafe());
+    private void NotifyChanged(ProviderConnectionAdmissionSnapshot? snapshot)
+    {
+        if (snapshot is { } s)
+            _onChanged?.Invoke(s);
+    }
 
     private LinkedList<Waiter> GetQueue(
         ProviderConnectionKind kind,

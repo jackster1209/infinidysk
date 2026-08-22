@@ -3,6 +3,8 @@ namespace NzbWebDAV.Clients.Usenet.Connections;
 /// <summary>
 /// Effective per-provider transfer and metadata limits for split connection scheduling.
 /// A null configured transfer limit is legacy mode and therefore does not produce a budget.
+/// The same formula is duplicated for client-side preview in
+/// frontend/app/routes/settings/usenet/provider-connection-budget.ts — keep both in sync.
 /// </summary>
 internal readonly record struct ProviderConnectionBudget(
     int EffectiveProviderLimit,

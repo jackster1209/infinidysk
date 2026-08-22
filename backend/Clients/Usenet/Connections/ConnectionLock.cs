@@ -52,11 +52,19 @@ public sealed class ConnectionLock<T> : IDisposable
     /// Couples an operation-level admission lease to this physical connection lease.
     /// The callback runs exactly once when the connection is returned or destroyed.
     /// </summary>
+    /// <remarks>
+    /// Only one callback may be attached per lock instance. A physical connection
+    /// maps to exactly one logical operation, so multiple callbacks would indicate
+    /// a lifecycle error. Callers needing to release multiple leases should compose
+    /// them into a single lambda (see MultiConnectionNntpClient for an example).
+    /// </remarks>
     internal void AttachDisposeCallback(Action callback)
     {
         ArgumentNullException.ThrowIfNull(callback);
         if (Interlocked.CompareExchange(ref _onDisposed, callback, null) is not null)
-            throw new InvalidOperationException("A dispose callback is already attached.");
+            throw new InvalidOperationException(
+                "A dispose callback is already attached. Each connection lock supports exactly one "
+                + "callback — compose multiple lease disposals into a single lambda.");
 
         // Defensive race handling: callers attach before publishing the lock, but if a
         // concurrent dispose wins, release the operation lease here instead.
