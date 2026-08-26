@@ -254,6 +254,7 @@ public sealed class HealthCheckStatScheduler : BackgroundService
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         _stoppingToken = stoppingToken;
+        Exception? schedulerFailure = null;
         using var stoppingRegistration = stoppingToken.Register(
             () => _events.Writer.TryWrite(StopScheduler.Instance));
 
@@ -274,17 +275,59 @@ public sealed class HealthCheckStatScheduler : BackgroundService
                     break;
             }
         }
+        catch (Exception exception)
+        {
+            schedulerFailure = exception;
+            throw;
+        }
         finally
         {
-            _events.Writer.TryComplete();
+            _events.Writer.TryComplete(schedulerFailure);
+            RejectQueuedRequests(schedulerFailure, stoppingToken);
             foreach (var session in _sessions.Values)
             {
                 await session.Cancellation.CancelAsync().ConfigureAwait(false);
-                session.Completion.TrySetCanceled(stoppingToken);
+                if (schedulerFailure is null)
+                    session.Completion.TrySetCanceled(stoppingToken);
+                else
+                    session.Completion.TrySetException(schedulerFailure);
                 session.Cancellation.Dispose();
             }
+            foreach (var assignment in _assignments.Values)
+                assignment.DisposeLeases();
+            _assignments.Clear();
             _sessions.Clear();
             PublishSnapshot();
+        }
+    }
+
+    private void RejectQueuedRequests(Exception? schedulerFailure, CancellationToken stoppingToken)
+    {
+        var unavailable = new InvalidOperationException(
+            schedulerFailure is null
+                ? "The health-check STAT scheduler stopped before processing the request."
+                : "The health-check STAT scheduler failed before processing the request.",
+            schedulerFailure);
+        while (_events.Reader.TryRead(out var schedulerEvent))
+        {
+            switch (schedulerEvent)
+            {
+                case RegisterSession registration when schedulerFailure is null:
+                    registration.Completion.TrySetCanceled(stoppingToken);
+                    break;
+                case RegisterSession failedRegistration:
+                    failedRegistration.Completion.TrySetException(unavailable);
+                    break;
+                case AppendSessionWork append:
+                    append.Completion.TrySetException(unavailable);
+                    break;
+                case CompleteSessionInput completeInput:
+                    completeInput.Completion.TrySetException(unavailable);
+                    break;
+                case AssignmentFinished finished:
+                    finished.Assignment.DisposeLeases();
+                    break;
+            }
         }
     }
 
