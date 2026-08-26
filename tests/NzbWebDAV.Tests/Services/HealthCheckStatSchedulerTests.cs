@@ -633,6 +633,162 @@ public sealed class HealthCheckStatSchedulerTests
         Assert.Equal(30, result.Completed);
     }
 
+    [Fact]
+    public async Task IncrementalSession_AcceptsWorkUntilInputIsCompleted()
+    {
+        await using var harness = await SchedulerHarness.CreateAsync(limit: 1);
+        harness.Scheduler.ChunkSizeOverride = 2;
+        var executor = new ControlledExecutor();
+        var session = harness.Scheduler.OpenDetailedSession(
+            new HealthCheckStatSessionRequest(
+                Guid.NewGuid(),
+                Guid.NewGuid(),
+                0,
+                HealthCheckStatMode.CollectMissing),
+            async (segments, progress, cancellationToken) => new HealthCheckStatChunkResult(
+                await executor.ExecuteAsync(segments, progress, cancellationToken),
+                []),
+            chunkObserver: null,
+            progress: null,
+            CancellationToken.None);
+
+        await session.AppendAsync(["segment-0", "segment-1"]);
+        await WaitUntilAsync(() => executor.InvocationCount == 1);
+        executor.CompleteOne();
+        await WaitUntilAsync(() => harness.Scheduler.GetSnapshot().ActiveAssignments == 0);
+        Assert.False(session.Completion.IsCompleted);
+
+        await session.AppendAsync(["segment-2", "segment-3"]);
+        await WaitUntilAsync(() => executor.InvocationCount == 2);
+        executor.CompleteOne();
+        await WaitUntilAsync(() => harness.Scheduler.GetSnapshot().ActiveAssignments == 0);
+        Assert.False(session.Completion.IsCompleted);
+
+        await session.CompleteInputAsync();
+        var result = await session.Completion;
+        Assert.Equal(4, result.Completed);
+        Assert.Empty(result.MissingIndices);
+    }
+
+    [Fact]
+    public async Task IncrementalSession_RejectsAppendAfterInputCompletion()
+    {
+        await using var harness = await SchedulerHarness.CreateAsync(limit: 1);
+        var session = harness.Scheduler.OpenDetailedSession(
+            new HealthCheckStatSessionRequest(
+                Guid.NewGuid(),
+                Guid.NewGuid(),
+                0,
+                HealthCheckStatMode.CollectMissing),
+            (_, _, _) => Task.FromResult(new HealthCheckStatChunkResult([], [])),
+            chunkObserver: null,
+            progress: null,
+            CancellationToken.None);
+
+        await session.CompleteInputAsync();
+        await session.Completion;
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => session.AppendAsync(["too-late"]));
+    }
+
+    [Fact]
+    public async Task ChunkObserver_RunsAfterAdmissionLeasesAreReleased()
+    {
+        await using var harness = await SchedulerHarness.CreateAsync(
+            limit: 1,
+            new ProviderDefinition("provider-a", ConnectionLimit: 2, TransferLimit: 1));
+        var observation = new TaskCompletionSource<HealthCheckStatChunkCompletion>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var session = harness.Scheduler.OpenDetailedSession(
+            new HealthCheckStatSessionRequest(
+                Guid.NewGuid(),
+                Guid.NewGuid(),
+                0,
+                HealthCheckStatMode.CollectMissing,
+                "provider-a"),
+            (_, _, _) => Task.FromResult(new HealthCheckStatChunkResult(
+                ["segment-1"],
+                ["segment-2"])),
+            chunk =>
+            {
+                Assert.Equal(0, harness.Gate.GetSnapshot().Active);
+                Assert.Equal(0, harness.GetProviderAdmission("provider-a")?.ActiveMetadataOperations);
+                observation.SetResult(chunk);
+            },
+            progress: null,
+            CancellationToken.None);
+
+        await session.AppendAsync(["segment-0", "segment-1", "segment-2"]);
+        await session.CompleteInputAsync();
+        var result = await session.Completion;
+        var chunk = await observation.Task.WaitAsync(TestTimeout);
+
+        Assert.Equal(["segment-0", "segment-1", "segment-2"], chunk.SegmentIds);
+        Assert.Equal(["segment-1"], chunk.MissingIds);
+        Assert.Equal(["segment-2"], chunk.UnansweredIds);
+        Assert.Equal([1], result.MissingIndices);
+        Assert.Equal([2], result.UnansweredIndices);
+    }
+
+    [Fact]
+    public async Task SessionsFromOneRun_ShareOneFairnessClaim()
+    {
+        await using var harness = await SchedulerHarness.CreateAsync(limit: 4);
+        var held = new List<HealthCheckConnectionGate.Lease>();
+        for (var index = 0; index < 4; index++)
+        {
+            held.Add(await harness.Gate.AcquireAsync(
+                HealthCheckAdmissionPriority.Queue,
+                CancellationToken.None));
+        }
+        var sharedRunId = Guid.NewGuid();
+        var otherRunId = Guid.NewGuid();
+        using var cancellation = new CancellationTokenSource();
+
+        async Task<HealthCheckStatScheduler.IncrementalSession> OpenAsync(Guid runId)
+        {
+            var executor = new ControlledExecutor();
+            var session = harness.Scheduler.OpenDetailedSession(
+                new HealthCheckStatSessionRequest(
+                    runId,
+                    Guid.NewGuid(),
+                    0,
+                    HealthCheckStatMode.CollectMissing),
+                async (segments, progress, cancellationToken) => new HealthCheckStatChunkResult(
+                    await executor.ExecuteAsync(segments, progress, cancellationToken),
+                    []),
+                chunkObserver: null,
+                progress: null,
+                cancellation.Token);
+            await session.AppendAsync(
+                Enumerable.Range(0, 20).Select(index => $"{runId:N}-{index}").ToArray());
+            await session.CompleteInputAsync();
+            return session;
+        }
+
+        var sessions = new[]
+        {
+            await OpenAsync(sharedRunId),
+            await OpenAsync(sharedRunId),
+            await OpenAsync(otherRunId),
+        };
+        await WaitUntilAsync(() => harness.Scheduler.GetSnapshot().Sessions.Count == 3);
+        foreach (var lease in held)
+            lease.Dispose();
+        await WaitUntilAsync(() => harness.Scheduler.GetSnapshot().ActiveAssignments == 4);
+
+        var activeByRun = harness.Scheduler.GetSnapshot().Sessions
+            .GroupBy(session => session.RunId)
+            .ToDictionary(group => group.Key, group => group.Sum(session => session.InFlight));
+        Assert.Equal(2, activeByRun[sharedRunId]);
+        Assert.Equal(2, activeByRun[otherRunId]);
+
+        await cancellation.CancelAsync();
+        foreach (var session in sessions)
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => session.Completion);
+    }
+
     private static UsenetStatResponse Exists() => new()
     {
         ResponseCode = 223,

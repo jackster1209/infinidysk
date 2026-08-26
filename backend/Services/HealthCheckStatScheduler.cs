@@ -26,6 +26,13 @@ public sealed record HealthCheckStatRequest(
     HealthCheckStatMode Mode,
     string? ProviderKey = null);
 
+public sealed record HealthCheckStatSessionRequest(
+    Guid RunId,
+    Guid DavItemId,
+    int PhaseId,
+    HealthCheckStatMode Mode,
+    string? ProviderKey = null);
+
 public sealed record HealthCheckStatResult(
     IReadOnlyList<int> MissingIndices,
     int Completed)
@@ -38,6 +45,11 @@ public sealed record HealthCheckStatResult(
 /// matching occurrence in that executor's input chunk.
 /// </summary>
 public sealed record HealthCheckStatChunkResult(
+    IReadOnlyList<string> MissingIds,
+    IReadOnlyList<string> UnansweredIds);
+
+public sealed record HealthCheckStatChunkCompletion(
+    IReadOnlyList<string> SegmentIds,
     IReadOnlyList<string> MissingIds,
     IReadOnlyList<string> UnansweredIds);
 
@@ -173,7 +185,7 @@ public sealed class HealthCheckStatScheduler : BackgroundService
             cancellationToken);
     }
 
-    public Task<HealthCheckStatResult> RunDetailedAsync(
+    public async Task<HealthCheckStatResult> RunDetailedAsync(
         HealthCheckStatRequest request,
         HealthCheckStatDetailedChunkExecutor executor,
         IProgress<int>? progress,
@@ -183,17 +195,52 @@ public sealed class HealthCheckStatScheduler : BackgroundService
         ArgumentNullException.ThrowIfNull(executor);
         ArgumentNullException.ThrowIfNull(request.SegmentIds);
 
+        var session = OpenDetailedSession(
+            new HealthCheckStatSessionRequest(
+                request.RunId,
+                request.DavItemId,
+                request.PhaseId,
+                request.Mode,
+                request.ProviderKey),
+            executor,
+            chunkObserver: null,
+            progress,
+            cancellationToken);
+        await session.AppendAsync(request.SegmentIds).ConfigureAwait(false);
+        await session.CompleteInputAsync().ConfigureAwait(false);
+        return await session.Completion.ConfigureAwait(false);
+    }
+
+    public IncrementalSession OpenDetailedSession(
+        HealthCheckStatSessionRequest request,
+        HealthCheckStatDetailedChunkExecutor executor,
+        Action<HealthCheckStatChunkCompletion>? chunkObserver,
+        IProgress<int>? progress,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        ArgumentNullException.ThrowIfNull(executor);
+
         var sessionId = Guid.NewGuid();
         var completion = new TaskCompletionSource<HealthCheckStatResult>(
             TaskCreationOptions.RunContinuationsAsynchronously);
         var registration = new RegisterSession(
-            sessionId, request, executor, progress, completion, cancellationToken);
+            sessionId,
+            request,
+            executor,
+            chunkObserver,
+            progress,
+            completion,
+            cancellationToken);
         if (!_events.Writer.TryWrite(registration))
             throw new InvalidOperationException("The health-check STAT scheduler is not accepting work.");
 
         var cancellationRegistration = cancellationToken.Register(
             () => _events.Writer.TryWrite(new CancelSession(sessionId, cancellationToken)));
-        return AwaitCompletionAsync(completion.Task, cancellationRegistration);
+        return new IncrementalSession(
+            this,
+            sessionId,
+            AwaitCompletionAsync(completion.Task, cancellationRegistration));
     }
 
     public HealthCheckStatSchedulerSnapshot GetSnapshot() => Volatile.Read(ref _snapshot);
@@ -256,6 +303,12 @@ public sealed class HealthCheckStatScheduler : BackgroundService
             case RegisterSession registration:
                 Register(registration);
                 break;
+            case AppendSessionWork append:
+                Append(append);
+                break;
+            case CompleteSessionInput completeInput:
+                CompleteInput(completeInput);
+                break;
             case CancelSession cancellation:
                 Cancel(cancellation);
                 break;
@@ -296,6 +349,42 @@ public sealed class HealthCheckStatScheduler : BackgroundService
             return;
         }
 
+        TryCompleteSession(session);
+    }
+
+    private void Append(AppendSessionWork append)
+    {
+        if (!_sessions.TryGetValue(append.SessionId, out var session)
+            || session.Status is not SessionStatus.Running)
+        {
+            append.Completion.TrySetException(new InvalidOperationException(
+                "The health-check STAT session is no longer accepting work."));
+            return;
+        }
+
+        if (session.InputCompleted)
+        {
+            append.Completion.TrySetException(new InvalidOperationException(
+                "The health-check STAT session input is already complete."));
+            return;
+        }
+
+        session.SegmentIds.AddRange(append.SegmentIds);
+        append.Completion.TrySetResult();
+    }
+
+    private void CompleteInput(CompleteSessionInput completeInput)
+    {
+        if (!_sessions.TryGetValue(completeInput.SessionId, out var session)
+            || session.Status is not SessionStatus.Running)
+        {
+            completeInput.Completion.TrySetException(new InvalidOperationException(
+                "The health-check STAT session is no longer accepting work."));
+            return;
+        }
+
+        session.InputCompleted = true;
+        completeInput.Completion.TrySetResult();
         TryCompleteSession(session);
     }
 
@@ -340,6 +429,7 @@ public sealed class HealthCheckStatScheduler : BackgroundService
         if (!_assignments.Remove(finished.Assignment.Id, out var assignment)) return;
         var session = assignment.Session;
         session.InFlight--;
+        assignment.DisposeLeases();
 
         if (session.Status is SessionStatus.Running)
         {
@@ -379,6 +469,22 @@ public sealed class HealthCheckStatScheduler : BackgroundService
                 }
 
                 ReportProgress(session);
+
+                try
+                {
+                    session.ChunkObserver?.Invoke(new HealthCheckStatChunkCompletion(
+                        assignment.SegmentIds,
+                        finished.MissingOffsets is { Count: > 0 } missingOffsets
+                            ? missingOffsets.Select(offset => assignment.SegmentIds[offset]).ToArray()
+                            : [],
+                        finished.UnansweredOffsets is { Count: > 0 } unansweredOffsets
+                            ? unansweredOffsets.Select(offset => assignment.SegmentIds[offset]).ToArray()
+                            : []));
+                }
+                catch (Exception exception) when (exception is not OutOfMemoryException)
+                {
+                    FailSession(session, exception);
+                }
             }
         }
 
@@ -417,9 +523,11 @@ public sealed class HealthCheckStatScheduler : BackgroundService
     {
         if (session.InFlight > 0) return;
 
-        if (session.Status == SessionStatus.Running
-            && session.NextIndex < session.Request.SegmentIds.Count)
-            return;
+        if (session.Status == SessionStatus.Running)
+        {
+            if (session.NextIndex < session.SegmentIds.Count) return;
+            if (!session.InputCompleted) return;
+        }
 
         switch (session.Status)
         {
@@ -427,11 +535,11 @@ public sealed class HealthCheckStatScheduler : BackgroundService
                 // Everything was dispatched and nothing is in flight. If fewer segments were
                 // verified than requested, an assignment ended without reporting its work;
                 // surface that instead of a result the caller would read as verified.
-                if (session.Completed != session.Request.SegmentIds.Count)
+                if (session.Completed != session.SegmentIds.Count)
                 {
                     session.Completion.TrySetException(new IncompleteHealthCheckSweepException(
                         session.Request.DavItemId,
-                        session.Request.SegmentIds.Count,
+                        session.SegmentIds.Count,
                         session.Completed));
                     _failures++;
                     break;
@@ -482,7 +590,7 @@ public sealed class HealthCheckStatScheduler : BackgroundService
     /// </summary>
     private int NextChunkLength(SessionState session)
     {
-        var remaining = session.Request.SegmentIds.Count - session.NextIndex;
+        var remaining = session.SegmentIds.Count - session.NextIndex;
         if (remaining <= 1) return Math.Max(1, remaining);
         if (ChunkSizeOverride is { } pinned) return Math.Min(Math.Max(1, pinned), remaining);
 
@@ -492,7 +600,7 @@ public sealed class HealthCheckStatScheduler : BackgroundService
         var capacity = Math.Max(1, GetProviderSchedulingCapacity(session.Request.ProviderKey));
         var runnable = Math.Max(1, _sessions.Values.Count(other =>
             other.Status == SessionStatus.Running
-            && other.NextIndex < other.Request.SegmentIds.Count
+            && other.NextIndex < other.SegmentIds.Count
             && string.Equals(
                 other.Request.ProviderKey,
                 session.Request.ProviderKey,
@@ -526,13 +634,27 @@ public sealed class HealthCheckStatScheduler : BackgroundService
     }
 
     private IEnumerable<SessionState> SelectCandidateSessions(
-        HashSet<string> blockedProviders) => _sessions.Values
-        .Where(session => session.Status == SessionStatus.Running
-                          && session.NextIndex < session.Request.SegmentIds.Count
-                          && (session.Request.ProviderKey is null
-                              || !blockedProviders.Contains(session.Request.ProviderKey)))
-        .OrderBy(session => session.InFlight)
-        .ThenBy(session => session.LastDispatchSequence);
+        HashSet<string> blockedProviders)
+    {
+        var runLoads = _sessions.Values
+            .Where(session => session.Status == SessionStatus.Running)
+            .GroupBy(session => session.Request.RunId)
+            .ToDictionary(
+                group => group.Key,
+                group => new RunLoad(
+                    group.Sum(session => session.InFlight),
+                    group.Max(session => session.LastDispatchSequence)));
+
+        return _sessions.Values
+            .Where(session => session.Status == SessionStatus.Running
+                              && session.NextIndex < session.SegmentIds.Count
+                              && (session.Request.ProviderKey is null
+                                  || !blockedProviders.Contains(session.Request.ProviderKey)))
+            .OrderBy(session => runLoads[session.Request.RunId].InFlight)
+            .ThenBy(session => runLoads[session.Request.RunId].LastDispatchSequence)
+            .ThenBy(session => session.InFlight)
+            .ThenBy(session => session.LastDispatchSequence);
+    }
 
     private void ReconcileAssignments()
     {
@@ -615,9 +737,7 @@ public sealed class HealthCheckStatScheduler : BackgroundService
         var processed = 0;
         var succeeded = false;
         var session = assignment.Session;
-        var segmentIds = new string[assignment.Length];
-        for (var i = 0; i < assignment.Length; i++)
-            segmentIds[i] = session.Request.SegmentIds[assignment.Offset + i];
+        var segmentIds = assignment.SegmentIds;
 
         try
         {
@@ -701,15 +821,15 @@ public sealed class HealthCheckStatScheduler : BackgroundService
                     session.Request.DavItemId, assignment.Length, Volatile.Read(ref processed));
             }
 
-            // Publish completion before releasing either lease so channel ordering lets the
-            // actor retire this assignment before release events trigger reconciliation.
-            _events.Writer.TryWrite(new AssignmentFinished(
+            // The actor retires the assignment and releases both leases before notifying
+            // downstream observers that the completed chunk is available.
+            if (!_events.Writer.TryWrite(new AssignmentFinished(
                 assignment,
                 succeeded ? missingOffsets : null,
                 succeeded ? unansweredOffsets : null,
                 Volatile.Read(ref processed),
-                exception));
-            assignment.DisposeLeases();
+                exception)))
+                assignment.DisposeLeases();
         }
     }
 
@@ -774,14 +894,14 @@ public sealed class HealthCheckStatScheduler : BackgroundService
                 session.Status.ToString(),
                 session.InFlight,
                 session.Completed,
-                session.Request.SegmentIds.Count))
+                session.SegmentIds.Count))
             .ToArray();
         var runnable = _sessions.Values.Count(session =>
             session.Status == SessionStatus.Running
-            && session.NextIndex < session.Request.SegmentIds.Count);
+            && session.NextIndex < session.SegmentIds.Count);
         var pendingSegments = _sessions.Values
             .Where(session => session.Status == SessionStatus.Running)
-            .Sum(session => (long)session.Request.SegmentIds.Count - session.NextIndex);
+            .Sum(session => (long)session.SegmentIds.Count - session.NextIndex);
 
         var activeByProvider = _assignments.Values
             .Where(assignment => assignment.Session.Request.ProviderKey is not null)
@@ -791,7 +911,7 @@ public sealed class HealthCheckStatScheduler : BackgroundService
             .ToDictionary(group => group.Key, group => group.ToArray(), StringComparer.Ordinal);
         var runnableByProvider = _sessions.Values
             .Where(session => session.Status == SessionStatus.Running
-                              && session.NextIndex < session.Request.SegmentIds.Count
+                              && session.NextIndex < session.SegmentIds.Count
                               && session.Request.ProviderKey is not null)
             .GroupBy(session => session.Request.ProviderKey!, StringComparer.Ordinal)
             .ToDictionary(group => group.Key, group => group.ToArray(), StringComparer.Ordinal);
@@ -810,7 +930,7 @@ public sealed class HealthCheckStatScheduler : BackgroundService
                     active.Length,
                     runnableSessions.Length,
                     runnableSessions.Sum(session =>
-                        (long)session.Request.SegmentIds.Count - session.NextIndex),
+                        (long)session.SegmentIds.Count - session.NextIndex),
                     // Nothing is blocked on the provider unless the last pass found it
                     // saturated while sessions still had work to dispatch.
                     isBlocked ? runnableSessions.Length : 0,
@@ -851,11 +971,19 @@ public sealed class HealthCheckStatScheduler : BackgroundService
     private abstract record SchedulerEvent;
     private sealed record RegisterSession(
         Guid SessionId,
-        HealthCheckStatRequest Request,
+        HealthCheckStatSessionRequest Request,
         HealthCheckStatDetailedChunkExecutor Executor,
+        Action<HealthCheckStatChunkCompletion>? ChunkObserver,
         IProgress<int>? Progress,
         TaskCompletionSource<HealthCheckStatResult> Completion,
         CancellationToken CancellationToken) : SchedulerEvent;
+    private sealed record AppendSessionWork(
+        Guid SessionId,
+        IReadOnlyList<string> SegmentIds,
+        TaskCompletionSource Completion) : SchedulerEvent;
+    private sealed record CompleteSessionInput(
+        Guid SessionId,
+        TaskCompletionSource Completion) : SchedulerEvent;
     private sealed record CancelSession(
         Guid SessionId,
         CancellationToken CancellationToken) : SchedulerEvent;
@@ -894,15 +1022,21 @@ public sealed class HealthCheckStatScheduler : BackgroundService
         public SessionState Session { get; } = session;
         public int Offset { get; } = offset;
         public int Length { get; } = length;
+        public IReadOnlyList<string> SegmentIds { get; } = session.SegmentIds
+            .Skip(offset)
+            .Take(length)
+            .ToArray();
         public HealthCheckProviderLease? ProviderLease { get; } = providerLease;
         public HealthCheckConnectionGate.Lease GlobalLease { get; } = globalLease;
         public Task? Execution { get; set; }
+        private int _leasesDisposed;
 
         /// <summary>Chunk-relative progress already folded into the session's completed count.</summary>
         public int ReportedProgress { get; set; }
 
         public void DisposeLeases()
         {
+            if (Interlocked.Exchange(ref _leasesDisposed, 1) != 0) return;
             try
             {
                 GlobalLease.Dispose();
@@ -921,6 +1055,7 @@ public sealed class HealthCheckStatScheduler : BackgroundService
             Id = registration.SessionId;
             Request = registration.Request;
             Executor = registration.Executor;
+            ChunkObserver = registration.ChunkObserver;
             Progress = registration.Progress;
             RequestCancellationToken = registration.CancellationToken;
             CancellationToken = registration.CancellationToken;
@@ -929,13 +1064,15 @@ public sealed class HealthCheckStatScheduler : BackgroundService
         }
 
         public Guid Id { get; }
-        public HealthCheckStatRequest Request { get; }
+        public HealthCheckStatSessionRequest Request { get; }
         public HealthCheckStatDetailedChunkExecutor Executor { get; }
+        public Action<HealthCheckStatChunkCompletion>? ChunkObserver { get; }
         public IProgress<int>? Progress { get; }
         public CancellationToken RequestCancellationToken { get; }
         public CancellationToken CancellationToken { get; set; }
         public TaskCompletionSource<HealthCheckStatResult> Completion { get; }
         public CancellationTokenSource Cancellation { get; }
+        public List<string> SegmentIds { get; } = [];
         public List<int> MissingIndices { get; } = [];
         public List<int> UnansweredIndices { get; } = [];
         public SessionStatus Status { get; set; }
@@ -944,6 +1081,53 @@ public sealed class HealthCheckStatScheduler : BackgroundService
         public int InFlight { get; set; }
         public int Completed { get; set; }
         public long LastDispatchSequence { get; set; }
+        public bool InputCompleted { get; set; }
+    }
+
+    private sealed record RunLoad(int InFlight, long LastDispatchSequence);
+
+    public sealed class IncrementalSession
+    {
+        private readonly HealthCheckStatScheduler _scheduler;
+        private readonly Guid _sessionId;
+
+        internal IncrementalSession(
+            HealthCheckStatScheduler scheduler,
+            Guid sessionId,
+            Task<HealthCheckStatResult> completion)
+        {
+            _scheduler = scheduler;
+            _sessionId = sessionId;
+            Completion = completion;
+        }
+
+        public Task<HealthCheckStatResult> Completion { get; }
+
+        public Task AppendAsync(IReadOnlyList<string> segmentIds)
+        {
+            ArgumentNullException.ThrowIfNull(segmentIds);
+            var completion = new TaskCompletionSource(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            if (!_scheduler._events.Writer.TryWrite(new AppendSessionWork(
+                    _sessionId,
+                    segmentIds.ToArray(),
+                    completion)))
+                throw new InvalidOperationException(
+                    "The health-check STAT scheduler is not accepting work.");
+            return completion.Task;
+        }
+
+        public Task CompleteInputAsync()
+        {
+            var completion = new TaskCompletionSource(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            if (!_scheduler._events.Writer.TryWrite(new CompleteSessionInput(
+                    _sessionId,
+                    completion)))
+                throw new InvalidOperationException(
+                    "The health-check STAT scheduler is not accepting work.");
+            return completion.Task;
+        }
     }
 
     /// <summary>
