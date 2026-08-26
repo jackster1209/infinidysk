@@ -212,6 +212,11 @@ public sealed class HealthCheckStatScheduler : BackgroundService
         return await session.Completion.ConfigureAwait(false);
     }
 
+    /// <summary>Opens a provider-local session whose input can be appended incrementally.</summary>
+    /// <param name="chunkObserver">
+    /// Invoked serially on the scheduler actor thread after assignment admission leases are
+    /// released. Keep the callback cheap and non-blocking; an exception fails the session.
+    /// </param>
     public IncrementalSession OpenDetailedSession(
         HealthCheckStatSessionRequest request,
         HealthCheckStatDetailedChunkExecutor executor,

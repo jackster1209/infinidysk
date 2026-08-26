@@ -1064,90 +1064,90 @@ public class HealthCheckService : BackgroundService
         stageDiagnostics[0].AddQueueInput(total);
         var sessions = new HealthCheckStatScheduler.IncrementalSession[order.Count];
         var buffers = new HealthCheckFailoverBuffer[order.Count - 1];
-        var indeterminate = new HashSet<string>(StringComparer.Ordinal);
+        var everUnanswered = new HashSet<string>(StringComparer.Ordinal);
         var finalUnresolved = new HashSet<string>(StringComparer.Ordinal);
-
-        // Open from the last provider backwards so every observer can hand work to an
-        // already-registered downstream session. All sessions share the run id, so the
-        // scheduler treats this pipeline as one fairness claimant.
-        for (var phase = order.Count - 1; phase >= 0; phase--)
-        {
-            var phaseIndex = phase;
-            var providerKey = order[phase].ProviderKey;
-            var diagnostics = stageDiagnostics[phaseIndex];
-            HealthCheckFailoverBuffer? downstream = null;
-            if (phase < order.Count - 1)
-            {
-                downstream = new HealthCheckFailoverBuffer(
-                    sessions[phase + 1].AppendAsync,
-                    _timeProvider,
-                    sweepCts.Token);
-                buffers[phase] = downstream;
-            }
-
-            sessions[phase] = _healthCheckStatScheduler.OpenDetailedSession(
-                new HealthCheckStatSessionRequest(
-                    runId,
-                    davItemId,
-                    basePhaseId + phase,
-                    HealthCheckStatMode.CollectMissing,
-                    providerKey),
-                async (chunk, chunkProgress, chunkCt) =>
-                {
-                    if (phaseIndex > 0)
-                    {
-                        Interlocked.CompareExchange(
-                            ref firstFallbackStarted,
-                            Stopwatch.GetTimestamp(),
-                            comparand: 0);
-                    }
-                    diagnostics.StartBatch(chunk.Count);
-                    var executionStarted = Stopwatch.GetTimestamp();
-                    try
-                    {
-                        var sweep = await _usenetClient.SweepProviderPipelinedAsync(
-                                providerKey, chunk, depth: 0, chunkProgress, chunkCt)
-                            .ConfigureAwait(false);
-                        return new HealthCheckStatChunkResult(sweep.Missing, sweep.Unanswered);
-                    }
-                    finally
-                    {
-                        diagnostics.CompleteBatchExecution(
-                            Stopwatch.GetTimestamp() - executionStarted);
-                    }
-                },
-                completion =>
-                {
-                    indeterminate.UnionWith(completion.UnansweredIds);
-                    var unresolvedIds = completion.MissingIds
-                        .Concat(completion.UnansweredIds)
-                        .ToHashSet(StringComparer.Ordinal);
-                    var unresolved = completion.SegmentIds
-                        .Where(unresolvedIds.Contains)
-                        .ToArray();
-                    diagnostics.RecordResults(
-                        completion.SegmentIds.Count - unresolved.Length,
-                        completion.MissingIds.Count,
-                        completion.UnansweredIds.Count,
-                        downstream is null ? 0 : unresolved.Length);
-                    sweepProgress.AdvanceTerminal(
-                        downstream is null
-                            ? completion.SegmentIds.Count
-                            : completion.SegmentIds.Count - unresolved.Length);
-                    if (downstream is not null)
-                    {
-                        stageDiagnostics[phaseIndex + 1].AddQueueInput(unresolved.Length);
-                        downstream.Add(unresolved);
-                    }
-                    else
-                        finalUnresolved.UnionWith(unresolved);
-                },
-                sweepProgress.Activity,
-                sweepCts.Token);
-        }
 
         try
         {
+            // Open from the last provider backwards so every observer can hand work to an
+            // already-registered downstream session. All sessions share the run id, so the
+            // scheduler treats this pipeline as one fairness claimant.
+            for (var phase = order.Count - 1; phase >= 0; phase--)
+            {
+                var phaseIndex = phase;
+                var providerKey = order[phase].ProviderKey;
+                var diagnostics = stageDiagnostics[phaseIndex];
+                HealthCheckFailoverBuffer? downstream = null;
+                if (phase < order.Count - 1)
+                {
+                    downstream = new HealthCheckFailoverBuffer(
+                        sessions[phase + 1].AppendAsync,
+                        _timeProvider,
+                        sweepCts.Token);
+                    buffers[phase] = downstream;
+                }
+
+                sessions[phase] = _healthCheckStatScheduler.OpenDetailedSession(
+                    new HealthCheckStatSessionRequest(
+                        runId,
+                        davItemId,
+                        basePhaseId + phase,
+                        HealthCheckStatMode.CollectMissing,
+                        providerKey),
+                    async (chunk, chunkProgress, chunkCt) =>
+                    {
+                        if (phaseIndex > 0)
+                        {
+                            Interlocked.CompareExchange(
+                                ref firstFallbackStarted,
+                                Stopwatch.GetTimestamp(),
+                                comparand: 0);
+                        }
+                        diagnostics.StartBatch(chunk.Count);
+                        var executionStarted = Stopwatch.GetTimestamp();
+                        try
+                        {
+                            var sweep = await _usenetClient.SweepProviderPipelinedAsync(
+                                    providerKey, chunk, depth: 0, chunkProgress, chunkCt)
+                                .ConfigureAwait(false);
+                            return new HealthCheckStatChunkResult(sweep.Missing, sweep.Unanswered);
+                        }
+                        finally
+                        {
+                            diagnostics.CompleteBatchExecution(
+                                Stopwatch.GetTimestamp() - executionStarted);
+                        }
+                    },
+                    completion =>
+                    {
+                        everUnanswered.UnionWith(completion.UnansweredIds);
+                        var unresolvedIds = completion.MissingIds
+                            .Concat(completion.UnansweredIds)
+                            .ToHashSet(StringComparer.Ordinal);
+                        var unresolved = completion.SegmentIds
+                            .Where(unresolvedIds.Contains)
+                            .ToArray();
+                        diagnostics.RecordResults(
+                            completion.SegmentIds.Count - unresolved.Length,
+                            completion.MissingIds.Count,
+                            completion.UnansweredIds.Count,
+                            downstream is null ? 0 : unresolved.Length);
+                        sweepProgress.AdvanceTerminal(
+                            downstream is null
+                                ? completion.SegmentIds.Count
+                                : completion.SegmentIds.Count - unresolved.Length);
+                        if (downstream is not null)
+                        {
+                            stageDiagnostics[phaseIndex + 1].AddQueueInput(unresolved.Length);
+                            downstream.Add(unresolved);
+                        }
+                        else
+                            finalUnresolved.UnionWith(unresolved);
+                    },
+                    sweepProgress.Activity,
+                    sweepCts.Token);
+            }
+
             await sessions[0].AppendAsync(logicalSegmentIds).ConfigureAwait(false);
             await sessions[0].CompleteInputAsync().ConfigureAwait(false);
             for (var phase = 0; phase < sessions.Length; phase++)
@@ -1195,9 +1195,9 @@ public class HealthCheckService : BackgroundService
         }
 
         var remaining = logicalSegmentIds.Where(finalUnresolved.Contains).ToArray();
-        if (indeterminate.Count > 0)
+        if (everUnanswered.Count > 0)
         {
-            var segmentId = remaining.FirstOrDefault(indeterminate.Contains);
+            var segmentId = remaining.FirstOrDefault(everUnanswered.Contains);
             if (segmentId is not null)
             {
                 LogSweepDiagnostics(

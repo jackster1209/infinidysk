@@ -732,6 +732,36 @@ public sealed class HealthCheckStatSchedulerTests
     }
 
     [Fact]
+    public async Task DownstreamObserverFailure_FailsSessionAndReleasesAssignments()
+    {
+        await using var harness = await SchedulerHarness.CreateAsync(
+            limit: 1,
+            new ProviderDefinition("provider-a", ConnectionLimit: 2, TransferLimit: 1));
+        var session = harness.Scheduler.OpenDetailedSession(
+            new HealthCheckStatSessionRequest(
+                Guid.NewGuid(),
+                Guid.NewGuid(),
+                0,
+                HealthCheckStatMode.CollectMissing,
+                "provider-a"),
+            (_, _, _) => Task.FromResult(new HealthCheckStatChunkResult(["segment-0"], [])),
+            _ => throw new InvalidOperationException("downstream session stopped accepting work"),
+            progress: null,
+            CancellationToken.None);
+
+        await session.AppendAsync(["segment-0"]);
+        await session.CompleteInputAsync();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => session.Completion);
+        Assert.Contains("downstream session stopped", exception.Message);
+        await WaitUntilAsync(() => harness.Scheduler.GetSnapshot().Sessions.Count == 0);
+        Assert.Equal(0, harness.Scheduler.GetSnapshot().ActiveAssignments);
+        Assert.Equal(0, harness.Gate.GetSnapshot().Active);
+        Assert.Equal(0, harness.GetProviderAdmission("provider-a")?.ActiveMetadataOperations);
+    }
+
+    [Fact]
     public async Task SessionsFromOneRun_ShareOneFairnessClaim()
     {
         await using var harness = await SchedulerHarness.CreateAsync(limit: 4);
