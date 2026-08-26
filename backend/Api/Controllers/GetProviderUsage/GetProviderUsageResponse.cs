@@ -38,5 +38,48 @@ public class GetProviderUsageResponse : BaseApiResponse
         /// Equals configured MaxConnections when no shrink has occurred.
         /// </summary>
         public int? EffectiveMaxConnections { get; set; }
+        /// <summary>
+        /// Configured provider-wide connection ceiling used to create the live pool.
+        /// </summary>
+        public int? ConfiguredMaxConnections { get; set; }
+        /// <summary>
+        /// Live operation-aware connection budget. Null means the provider is using
+        /// legacy shared-pool scheduling or has no active runtime snapshot.
+        /// </summary>
+        public ProviderConnectionBudgetItem? ConnectionBudget { get; set; }
+        /// <summary>
+        /// Live health-verification coverage state. Null when the provider has no active
+        /// runtime snapshot. Diagnostic only — nothing schedules on these values.
+        /// </summary>
+        public VerificationCoverageItem? VerificationCoverage { get; set; }
+    }
+
+    public class VerificationCoverageItem
+    {
+        /// <summary>"normal" or "deprioritized".</summary>
+        public string State { get; set; } = "normal";
+        /// <summary>Definitive STAT answers observed. Transport errors are excluded.</summary>
+        public int Samples { get; set; }
+        /// <summary>
+        /// Recency-weighted share of those answers that were definitive misses. Weighted
+        /// rather than counted, so it is not Samples multiplied by anything.
+        /// </summary>
+        public double MissRate { get; set; }
+        /// <summary>Times this provider has been deprioritized since process start.</summary>
+        public int Deprioritizations { get; set; }
+        public DateTimeOffset? LastTransitionAt { get; set; }
+    }
+
+    public class ProviderConnectionBudgetItem
+    {
+        public int ConfiguredTransferLimit { get; set; }
+        public int EffectiveTransferLimit { get; set; }
+        public int BaseMetadataCapacity { get; set; }
+        public int MetadataBurstAllowance { get; set; }
+        public int MaxMetadataCapacity { get; set; }
+        public int ActiveTransferOperations { get; set; }
+        public int ActiveMetadataOperations { get; set; }
+        public int WaitingTransferOperations { get; set; }
+        public int WaitingMetadataOperations { get; set; }
     }
 }
