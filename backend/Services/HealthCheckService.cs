@@ -975,17 +975,18 @@ public class HealthCheckService : BackgroundService
     }
 
     /// <summary>
-    /// Resolves <paramref name="segmentIds"/> by sweeping providers in order, one per phase,
-    /// and returns the ids no provider held.
+    /// Resolves <paramref name="segmentIds"/> through provider-local scheduler sessions and
+    /// returns the ids no provider held.
     ///
     /// Each phase pipelines a batch against a single provider over a single connection, so a
     /// scheduler assignment consumes exactly the one connection its lease accounts for. That
     /// is the property a chunked sweep with internal failover cannot offer, and the reason
     /// the earlier chunking attempt had to be reverted.
     ///
-    /// The provider order is snapshotted once: ranking moves as verification coverage state
-    /// and capacity change, and re-deriving it per phase could skip or repeat a provider
-    /// partway through a file.
+    /// As soon as one assignment finishes, its unresolved ids are coalesced into the next
+    /// provider session. Provider order is still snapshotted once: ranking moves as
+    /// verification coverage state and capacity change, and re-deriving it mid-sweep could
+    /// skip or repeat a provider partway through a file.
     /// </summary>
     private async Task<IReadOnlyList<string>> SweepProvidersAsync(
         Guid runId,
@@ -1046,44 +1047,109 @@ public class HealthCheckService : BackgroundService
             }
         });
 
-        var remaining = segmentIds;
+        using var sweepCts = ContextualCancellationTokenSource.CreateLinkedTokenSource(
+            statCts.Token);
+        var sessions = new HealthCheckStatScheduler.IncrementalSession[order.Count];
+        var buffers = new HealthCheckFailoverBuffer[order.Count - 1];
         var indeterminate = new HashSet<string>(StringComparer.Ordinal);
-        for (var phase = 0; phase < order.Count && remaining.Count > 0; phase++)
+        var finalUnresolved = new HashSet<string>(StringComparer.Ordinal);
+
+        // Open from the last provider backwards so every observer can hand work to an
+        // already-registered downstream session. All sessions share the run id, so the
+        // scheduler treats this pipeline as one fairness claimant.
+        for (var phase = order.Count - 1; phase >= 0; phase--)
         {
             var providerKey = order[phase].ProviderKey;
-            var phaseResult = await RunSweepSessionAsync(
+            HealthCheckFailoverBuffer? downstream = null;
+            if (phase < order.Count - 1)
+            {
+                downstream = new HealthCheckFailoverBuffer(
+                    sessions[phase + 1].AppendAsync,
+                    _timeProvider,
+                    sweepCts.Token);
+                buffers[phase] = downstream;
+            }
+
+            sessions[phase] = _healthCheckStatScheduler.OpenDetailedSession(
+                new HealthCheckStatSessionRequest(
                     runId,
                     davItemId,
                     basePhaseId + phase,
-                    providerKey,
-                    remaining,
-                    async (chunk, chunkProgress, chunkCt) =>
-                    {
-                        var sweep = await _usenetClient.SweepProviderPipelinedAsync(
-                                providerKey, chunk, depth: 0, chunkProgress, chunkCt)
-                            .ConfigureAwait(false);
-                        return new HealthCheckStatChunkResult(sweep.Missing, sweep.Unanswered);
-                    },
-                    sweepProgress.ForPhase(total - remaining.Count),
-                    statCts)
-                .ConfigureAwait(false);
-
-            var unresolvedThisPhase = phaseResult.Missing
-                .Concat(phaseResult.Unanswered)
-                .ToHashSet(StringComparer.Ordinal);
-            indeterminate.UnionWith(phaseResult.Unanswered);
-            indeterminate.IntersectWith(unresolvedThisPhase);
-            remaining = remaining
-                .Where(unresolvedThisPhase.Contains)
-                .ToArray();
+                    HealthCheckStatMode.CollectMissing,
+                    providerKey),
+                async (chunk, chunkProgress, chunkCt) =>
+                {
+                    var sweep = await _usenetClient.SweepProviderPipelinedAsync(
+                            providerKey, chunk, depth: 0, chunkProgress, chunkCt)
+                        .ConfigureAwait(false);
+                    return new HealthCheckStatChunkResult(sweep.Missing, sweep.Unanswered);
+                },
+                completion =>
+                {
+                    indeterminate.UnionWith(completion.UnansweredIds);
+                    var unresolvedIds = completion.MissingIds
+                        .Concat(completion.UnansweredIds)
+                        .ToHashSet(StringComparer.Ordinal);
+                    var unresolved = completion.SegmentIds
+                        .Where(unresolvedIds.Contains)
+                        .ToArray();
+                    if (downstream is not null)
+                        downstream.Add(unresolved);
+                    else
+                        finalUnresolved.UnionWith(unresolved);
+                },
+                // Keep the existing attempt-based display behavior in this performance
+                // commit. Logical terminal progress is intentionally a separate change.
+                sweepProgress.ForPhase(resolvedBefore: 0),
+                sweepCts.Token);
         }
 
+        try
+        {
+            await sessions[0].AppendAsync(segmentIds).ConfigureAwait(false);
+            await sessions[0].CompleteInputAsync().ConfigureAwait(false);
+            for (var phase = 0; phase < sessions.Length; phase++)
+            {
+                await sessions[phase].Completion.ConfigureAwait(false);
+                if (phase >= buffers.Length) continue;
+                await buffers[phase].CompleteAsync().ConfigureAwait(false);
+                await sessions[phase + 1].CompleteInputAsync().ConfigureAwait(false);
+            }
+        }
+        catch
+        {
+            await sweepCts.CancelAsync().ConfigureAwait(false);
+            foreach (var buffer in buffers)
+            {
+                if (buffer is null) continue;
+                try { await buffer.CompleteAsync().ConfigureAwait(false); }
+                catch (Exception exception) when (exception is not OutOfMemoryException)
+                {
+                    // The original sweep failure is the one the caller needs.
+                }
+            }
+            foreach (var session in sessions)
+            {
+                if (session is null) continue;
+                try { await session.Completion.ConfigureAwait(false); }
+                catch (Exception exception) when (exception is not OutOfMemoryException)
+                {
+                    // Drain cancellation so every scheduler lease is released before unwind.
+                }
+            }
+            throw;
+        }
+
+        var remaining = segmentIds.Where(finalUnresolved.Contains).ToArray();
         if (indeterminate.Count > 0)
         {
-            var segmentId = remaining.First(indeterminate.Contains);
-            throw new UsenetUnexpectedResponseException(
-                segmentId,
-                "one or more providers did not return a definitive STAT response");
+            var segmentId = remaining.FirstOrDefault(indeterminate.Contains);
+            if (segmentId is not null)
+            {
+                throw new UsenetUnexpectedResponseException(
+                    segmentId,
+                    "one or more providers did not return a definitive STAT response");
+            }
         }
 
         // Every phase that was going to run has run, so the sweep really is complete.

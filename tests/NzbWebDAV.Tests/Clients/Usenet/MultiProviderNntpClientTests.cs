@@ -2236,8 +2236,13 @@ public class MultiProviderNntpClientTests
         /// <summary>Throws after emitting this many pipelined results, to model a batch that dies partway.</summary>
         public int? PipelinedStatThrowAfter { get; init; }
 
+        /// <summary>Optional deterministic gate invoked when a pipelined STAT batch starts.</summary>
+        public Func<IReadOnlyList<string>, CancellationToken, Task>? BeforePipelinedStatAsync
+        { get; init; }
+
         /// <summary>Pipelined STAT batches issued — one per sweep, never per segment.</summary>
-        public int BatchStatRequests { get; private set; }
+        public int BatchStatRequests => Volatile.Read(ref _batchStatRequests);
+        private int _batchStatRequests;
         private readonly Queue<ArticleBodyCompletionHandler> _pendingSingularCallbacks = new();
 
         public override Task<UsenetDecodedBodyBatch> DecodedBodiesAsync(
@@ -2347,7 +2352,9 @@ public class MultiProviderNntpClientTests
                 yield break;
             }
 
-            BatchStatRequests++;
+            Interlocked.Increment(ref _batchStatRequests);
+            if (BeforePipelinedStatAsync is not null)
+                await BeforePipelinedStatAsync(segmentIds, cancellationToken);
             await Task.Yield();
             var emitted = 0;
             foreach (var segmentId in segmentIds)

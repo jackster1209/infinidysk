@@ -337,6 +337,66 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task ProviderFailover_StreamsCompletedChunksBeforeUpstreamPhaseFinishes()
+    {
+        var segments = NewSegmentIds(512);
+        var sizes = Enumerable.Repeat(10_000L, segments.Length).ToArray();
+        var (item, oldBlobId) = await AddVideoFileAsync("movie.mkv", segments, sizes);
+        var blockedBatchStarted = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseBlockedBatch = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var downstreamStarted = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var missing = new MultiProviderNntpClientTests.ScriptedNntpClient
+        {
+            BatchResponseCode = 430,
+            SingularResponseCode = (int)UsenetResponseType.NoArticleWithThatMessageId,
+            PipelinedStatHolds = [],
+            BeforePipelinedStatAsync = async (batch, cancellationToken) =>
+            {
+                if (!batch.Contains(segments[0])) return;
+                blockedBatchStarted.TrySetResult();
+                await releaseBlockedBatch.Task.WaitAsync(cancellationToken);
+            },
+        };
+        var holding = new MultiProviderNntpClientTests.ScriptedNntpClient
+        {
+            BatchResponseCode = 430,
+            SingularResponseCode = (int)UsenetResponseType.NoArticleWithThatMessageId,
+            PipelinedStatHolds = segments.ToHashSet(StringComparer.Ordinal),
+            BeforePipelinedStatAsync = (_, _) =>
+            {
+                downstreamStarted.TrySetResult();
+                return Task.CompletedTask;
+            },
+        };
+        var (service, par2) = await NewServiceAsync(
+            ProviderWalk(missing, holding),
+            par2Outcome: false);
+
+        var healthCheck = service.PerformHealthCheck(item, _dbClient, CancellationToken.None);
+        try
+        {
+            await blockedBatchStarted.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            await downstreamStarted.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            Assert.False(healthCheck.IsCompleted);
+        }
+        finally
+        {
+            releaseBlockedBatch.TrySetResult();
+        }
+        await healthCheck;
+
+        var row = Assert.Single(GetHealthRows(item.Id));
+        Assert.Equal(HealthCheckResult.HealthResult.Healthy, row.Result);
+        Assert.Empty(par2.Requests);
+        Assert.Equal(oldBlobId, ReloadItem(item.Id).FileBlobId);
+        Assert.True(missing.BatchStatRequests > 1);
+        Assert.True(holding.BatchStatRequests > 0);
+    }
+
+    [Fact]
     public async Task Par2Success_RecordsHealthyViaPar2_AndClearsRecord()
     {
         var segments = NewSegmentIds(6);
