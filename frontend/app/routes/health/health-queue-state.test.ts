@@ -126,4 +126,14 @@ describe("getVisibleHealthCheckItems", () => {
     expect(visible[0]!.id).toBe("item-11");
     expect(visible.map((item) => item.id)).not.toContain("item-9");
   });
+
+  it("surfaces an active zero-percent check ahead of waiting rows", () => {
+    const items = Array.from({ length: 12 }, (_, index) => queueItem(`item-${index}`, null));
+    items[11] = { ...items[11]!, progress: 0 };
+
+    const visible = getVisibleHealthCheckItems(items);
+
+    expect(visible[0]!.id).toBe("item-11");
+    expect(visible[0]!.progress).toBe(0);
+  });
 });

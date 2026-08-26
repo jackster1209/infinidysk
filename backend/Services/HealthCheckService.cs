@@ -562,9 +562,8 @@ public class HealthCheckService : BackgroundService
                               && sampled.Count == totalSegments;
 
             // setup progress tracking
-            var progressHook = new Progress<int>();
             var debounce = DebounceUtil.CreateDebounce(TimeSpan.FromMilliseconds(200));
-            progressHook.ProgressChanged += (_, progress) =>
+            var progressHook = new SynchronousProgress<int>(progress =>
             {
                 try { statCts?.CancelAfter(HealthCheckProgressTimeout); }
                 catch (ObjectDisposedException)
@@ -573,7 +572,7 @@ public class HealthCheckService : BackgroundService
                 }
                 var message = $"{davItem.Id}|{progress}";
                 debounce(() => _websocketManager.SendMessage(WebsocketTopic.HealthItemProgress, message));
-            };
+            });
 
             // Only cancel a STAT sweep after it has made no progress for a sustained
             // period. A complete/deep scan can otherwise run as long as it continues
@@ -582,12 +581,12 @@ public class HealthCheckService : BackgroundService
             using (statCts = ContextualCancellationTokenSource.CreateLinkedTokenSource(ct))
             {
                 statCts.CancelAfter(HealthCheckProgressTimeout);
-                var progress = progressHook.ToPercentage(statSegments.Count);
+                var progress = new SynchronousProgress<int>(completed =>
+                    progressHook.Report((int)((long)completed * 100 / statSegments.Count)));
 
-                // Verification runs one provider per phase: each phase pipelines the ids still
-                // unresolved against a single provider over a single connection, so a scheduler
-                // assignment never fans out and one lease still means one connection. Whatever
-                // survives the last phase is missing from every provider.
+                // Each scheduler assignment remains provider-local and uses one connection;
+                // completed chunks stream their unresolved ids into the next provider session.
+                // Whatever survives the final provider is missing everywhere.
                 var unresolved = await SweepProvidersAsync(
                         runId, davItem.Id, statSegments, progress, statCts)
                     .ConfigureAwait(false);
@@ -1038,7 +1037,7 @@ public class HealthCheckService : BackgroundService
         }
 
         var total = segmentIds.Count;
-        var sweepProgress = new CumulativeSweepProgress(progress, total, () =>
+        var sweepProgress = new LogicalSweepProgress(progress, total, () =>
         {
             try { statCts.CancelAfter(HealthCheckProgressTimeout); }
             catch (ObjectDisposedException)
@@ -1046,6 +1045,7 @@ public class HealthCheckService : BackgroundService
                 // racing teardown; the sweep is ending anyway
             }
         });
+        sweepProgress.Start();
 
         using var sweepCts = ContextualCancellationTokenSource.CreateLinkedTokenSource(
             statCts.Token);
@@ -1093,14 +1093,16 @@ public class HealthCheckService : BackgroundService
                     var unresolved = completion.SegmentIds
                         .Where(unresolvedIds.Contains)
                         .ToArray();
+                    sweepProgress.AdvanceTerminal(
+                        downstream is null
+                            ? completion.SegmentIds.Count
+                            : completion.SegmentIds.Count - unresolved.Length);
                     if (downstream is not null)
                         downstream.Add(unresolved);
                     else
                         finalUnresolved.UnionWith(unresolved);
                 },
-                // Keep the existing attempt-based display behavior in this performance
-                // commit. Logical terminal progress is intentionally a separate change.
-                sweepProgress.ForPhase(resolvedBefore: 0),
+                sweepProgress.Activity,
                 sweepCts.Token);
         }
 
@@ -1152,8 +1154,6 @@ public class HealthCheckService : BackgroundService
             }
         }
 
-        // Every phase that was going to run has run, so the sweep really is complete.
-        sweepProgress.Complete();
         return remaining;
     }
 

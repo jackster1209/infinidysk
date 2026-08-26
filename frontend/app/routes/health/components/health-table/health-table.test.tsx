@@ -17,6 +17,33 @@ describe("HealthTable", () => {
             nextHealthCheck: null,
             progress: 25,
           },
+          {
+            id: "item-zero",
+            name: "Starting.mkv",
+            path: "/view/Starting.mkv",
+            releaseDate: null,
+            lastHealthCheck: null,
+            nextHealthCheck: null,
+            progress: 0,
+          },
+          {
+            id: "item-96",
+            name: "Resolving.mkv",
+            path: "/view/Resolving.mkv",
+            releaseDate: null,
+            lastHealthCheck: null,
+            nextHealthCheck: null,
+            progress: 96,
+          },
+          {
+            id: "item-99",
+            name: "Finishing.mkv",
+            path: "/view/Finishing.mkv",
+            releaseDate: null,
+            lastHealthCheck: null,
+            nextHealthCheck: null,
+            progress: 99,
+          },
         ]}
         verificationLoad={{
           limit: 50,
@@ -76,6 +103,15 @@ describe("HealthTable", () => {
     expect(markup).not.toContain("Health Scheduler");
     expect(markup).not.toContain("runnable");
     expect(markup).not.toContain("12,345");
+
+    // An active check is explicit even before its first logical segment resolves, while
+    // ordinary and final-window progress retain their exact percentages.
+    expect(markup).toContain("0%");
+    expect(markup).toContain('value="0"');
+    expect(markup).toContain("96%");
+    expect(markup).toContain('value="96"');
+    expect(markup).toContain("99%");
+    expect(markup).toContain('value="99"');
   });
 
   it("shows Auto capacity instead of a synthetic ceiling", () => {
