@@ -13,7 +13,9 @@ public sealed class PrometheusMetricsCollector(
     ConcurrentReadTracker concurrentReads,
     MetricsWriter metricsWriter,
     UsenetStreamingClient usenetClient,
-    RepairPatchStore repairPatchStore) : BackgroundService
+    RepairPatchStore repairPatchStore,
+    HealthCheckConnectionGate healthCheckConnectionGate,
+    HealthCheckStatScheduler healthCheckStatScheduler) : BackgroundService
 {
     private static readonly TimeSpan Interval = TimeSpan.FromSeconds(5);
 
@@ -28,6 +30,8 @@ public sealed class PrometheusMetricsCollector(
                     metrics.Refresh(activeReads, concurrentReads, budget, metricsWriter, usenetClient);
                     metrics.SetPar2PatchStoreBytes(repairPatchStore.CurrentBytes);
                 }
+                metrics.SetHealthCheckGate(healthCheckConnectionGate.TakeMetricsSnapshot());
+                metrics.SetHealthCheckScheduler(healthCheckStatScheduler.GetSnapshot());
             }
             catch (Exception ex) when (ex is not OutOfMemoryException)
             {

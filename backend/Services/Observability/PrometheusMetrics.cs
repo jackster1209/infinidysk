@@ -24,6 +24,10 @@ public sealed class PrometheusMetrics
     private readonly Gauge _metricsQueueLength;
     private readonly Counter _metricsDropped;
     private readonly Gauge _poolConnections;
+    private readonly Gauge _healthCheckSchedulerProvider;
+    private readonly Gauge _healthCheckSchedulerGlobalBlocked;
+    private readonly Gauge _healthCheckSchedulerLegacyAssignments;
+    private readonly Gauge _nntpEffectiveStatPipelineDepth;
     private readonly Gauge _poolMaxConnections;
     private readonly Gauge _poolChurn;
     private readonly Gauge _circuitState;
@@ -31,8 +35,15 @@ public sealed class PrometheusMetrics
     private readonly Gauge _circuitTrips;
     private readonly Gauge _circuitFailures;
     private readonly Gauge _circuitArticleMisses;
+    private readonly Gauge _verificationCoverageState;
+    private readonly Gauge _verificationCoverageSamples;
+    private readonly Gauge _verificationCoverageMissRate;
+    private readonly Gauge _verificationCoverageDeprioritizations;
     private readonly Counter _segmentFetches;
     private readonly Histogram _segmentFetchDuration;
+    private readonly Counter _statAttempts;
+    private readonly Histogram _statAttemptDuration;
+    private readonly Histogram _statWalkDepth;
     private readonly Counter _seekCount;
     private readonly Histogram _seekLatency;
     private readonly Histogram _par2RepairDuration;
@@ -60,6 +71,21 @@ public sealed class PrometheusMetrics
     private readonly Counter _sharedStreamReadersServed;
     private readonly Counter _privateFallbacks;
     private readonly Counter _streamingCorruptSegments;
+    private readonly Gauge _healthCheckGateLimit;
+    private readonly Gauge _healthCheckGateActive;
+    private readonly Gauge _healthCheckGatePeakActive;
+    private readonly Gauge _healthCheckGateWaiting;
+    private readonly Gauge _healthCheckGatePeakWaiting;
+    private readonly Gauge _healthCheckSchedulerCapacity;
+    private readonly Gauge _healthCheckSchedulerActive;
+    private readonly Gauge _healthCheckSchedulerPendingAdmissions;
+    private readonly Gauge _healthCheckSchedulerRunnableSessions;
+    private readonly Gauge _healthCheckSchedulerSessions;
+    private readonly Gauge _healthCheckSchedulerPendingSegments;
+    private readonly Counter _healthCheckSchedulerDispatches;
+    private readonly Counter _healthCheckSchedulerCompletions;
+    private readonly Counter _healthCheckSchedulerCancellations;
+    private readonly Counter _healthCheckSchedulerFailures;
     private readonly HashSet<string> _providerKeys = new(StringComparer.Ordinal);
 
     public PrometheusMetrics(CollectorRegistry registry)
@@ -79,8 +105,8 @@ public sealed class PrometheusMetrics
             "Article RAM lease requests that encountered budget backpressure.");
         _metricsQueueLength = metrics.CreateGauge("nzbdav_metrics_queue_length", "Queued internal metric rows.", new GaugeConfiguration { LabelNames = ["queue"] });
         _metricsDropped = metrics.CreateCounter("nzbdav_metrics_dropped_total", "Dropped internal metric rows.", new CounterConfiguration { LabelNames = ["queue"] });
-        _poolConnections = metrics.CreateGauge("nzbdav_nntp_pool_connections", "NNTP pool connection state.", new GaugeConfiguration { LabelNames = ["provider_key", "state"] });
-        _poolMaxConnections = metrics.CreateGauge("nzbdav_nntp_pool_max_connections", "NNTP pool connection limits.", new GaugeConfiguration { LabelNames = ["provider_key", "limit"] });
+        _poolConnections = metrics.CreateGauge("nzbdav_nntp_pool_connections", "NNTP pool connection and admitted-operation state.", new GaugeConfiguration { LabelNames = ["provider_key", "state"] });
+        _poolMaxConnections = metrics.CreateGauge("nzbdav_nntp_pool_max_connections", "NNTP pool and operation-admission limits.", new GaugeConfiguration { LabelNames = ["provider_key", "limit"] });
         _poolChurn = metrics.CreateGauge("nzbdav_nntp_pool_churn_total", "NNTP pool lifetime churn.", new GaugeConfiguration { LabelNames = ["provider_key", "event"] });
         _circuitState = metrics.CreateGauge("nzbdav_circuit_state", "Circuit state: 0=closed, 1=open, 2=half_open.", new GaugeConfiguration { LabelNames = ["provider_key"] });
         _circuitCooldownSeconds = metrics.CreateGauge("nzbdav_circuit_cooldown_remaining_seconds", "Circuit cooldown remaining.", new GaugeConfiguration { LabelNames = ["provider_key"] });
@@ -89,6 +115,52 @@ public sealed class PrometheusMetrics
         _circuitArticleMisses = metrics.CreateGauge("nzbdav_circuit_article_misses_total", "Circuit article misses.", new GaugeConfiguration { LabelNames = ["provider_key"] });
         _segmentFetches = metrics.CreateCounter("nzbdav_segment_fetches_total", "Segment fetch outcomes.", new CounterConfiguration { LabelNames = ["provider_key", "status"] });
         _segmentFetchDuration = metrics.CreateHistogram("nzbdav_segment_fetch_duration_seconds", "Segment fetch duration.", new HistogramConfiguration { LabelNames = ["provider_key"], Buckets = Histogram.ExponentialBuckets(0.01, 2, 14) });
+        // Verification (STAT) telemetry. The SegmentFetch families above are transfer-centric
+        // and deliberately record nothing for a successful STAT, so they cannot describe how
+        // health checks resolve articles. These do, without changing that contract.
+        _statAttempts = metrics.CreateCounter(
+            "nzbdav_nntp_stat_attempts_total",
+            "STAT attempts per provider, including successes.",
+            new CounterConfiguration { LabelNames = ["provider_key", "result"] });
+        _statAttemptDuration = metrics.CreateHistogram(
+            "nzbdav_nntp_stat_duration_seconds",
+            "STAT attempt duration per provider.",
+            new HistogramConfiguration
+            {
+                LabelNames = ["provider_key", "result"],
+                Buckets = Histogram.ExponentialBuckets(0.01, 2, 14),
+            });
+        // Attempts made before a segment resolved. The le=1 bucket is the first-provider hit
+        // count; sum/count is the mean walk depth.
+        _statWalkDepth = metrics.CreateHistogram(
+            "nzbdav_nntp_stat_walk_depth",
+            "Provider attempts per resolved STAT.",
+            new HistogramConfiguration
+            {
+                LabelNames = ["outcome"],
+                Buckets = [1, 2, 3, 4, 6, 8, 12, 16],
+            });
+        // Health verification provider coverage. Verification keeps the configured provider
+        // order and only defends against it, so what an operator needs to see is which
+        // providers that defence is currently acting on and how much evidence stands behind
+        // it — not a ranking.
+        _verificationCoverageState = metrics.CreateGauge(
+            "nzbdav_nntp_verification_coverage_state",
+            "Health verification coverage state: 0=normal, 1=deprioritized.",
+            new GaugeConfiguration { LabelNames = ["provider_key"] });
+        _verificationCoverageSamples = metrics.CreateGauge(
+            "nzbdav_nntp_verification_coverage_samples",
+            "Definitive STAT answers observed per provider. Transport errors are excluded.",
+            new GaugeConfiguration { LabelNames = ["provider_key"] });
+        // Named for what is actually computed: a recency-weighted rate, not a sample ratio.
+        _verificationCoverageMissRate = metrics.CreateGauge(
+            "nzbdav_nntp_verification_coverage_miss_rate",
+            "Recency-weighted share of a provider's definitive STAT answers that were misses.",
+            new GaugeConfiguration { LabelNames = ["provider_key"] });
+        _verificationCoverageDeprioritizations = metrics.CreateGauge(
+            "nzbdav_nntp_verification_coverage_deprioritizations_total",
+            "Times a provider has been deprioritized for verification since process start.",
+            new GaugeConfiguration { LabelNames = ["provider_key"] });
         _seekCount = metrics.CreateCounter("nzbdav_seek_total", "Seek operations.", new CounterConfiguration { LabelNames = ["kind"] });
         _seekLatency = metrics.CreateHistogram("nzbdav_seek_latency_seconds", "Post-seek preparation latency.", new HistogramConfiguration { LabelNames = ["kind"], Buckets = Histogram.ExponentialBuckets(0.001, 2, 14) });
         _par2RepairJobs = metrics.CreateCounter(
@@ -169,6 +241,69 @@ public sealed class PrometheusMetrics
         _streamingCorruptSegments = metrics.CreateCounter(
             "nzbdav_streaming_corrupt_segments_total",
             "Streaming-confirmed corrupt Usenet articles.");
+        _healthCheckGateLimit = metrics.CreateGauge(
+            "nzbdav_health_check_gate_limit",
+            "Current aggregate health verification admission limit.");
+        _healthCheckGateActive = metrics.CreateGauge(
+            "nzbdav_health_check_gate_active",
+            "Current admitted health verification operations.");
+        _healthCheckGatePeakActive = metrics.CreateGauge(
+            "nzbdav_health_check_gate_peak_active",
+            "Maximum admitted health verification operations since the previous metrics refresh.");
+        _healthCheckGateWaiting = metrics.CreateGauge(
+            "nzbdav_health_check_gate_waiting",
+            "Current health verification operations waiting for admission.",
+            new GaugeConfiguration { LabelNames = ["priority"] });
+        _healthCheckGatePeakWaiting = metrics.CreateGauge(
+            "nzbdav_health_check_gate_peak_waiting",
+            "Maximum health verification operations waiting for admission since the previous metrics refresh.",
+            new GaugeConfiguration { LabelNames = ["priority"] });
+        _healthCheckSchedulerCapacity = metrics.CreateGauge(
+            "nzbdav_health_check_scheduler_capacity",
+            "Configured background STAT scheduler capacity.");
+        _healthCheckSchedulerActive = metrics.CreateGauge(
+            "nzbdav_health_check_scheduler_active_assignments",
+            "Current background STAT assignments executing under scheduler-owned gate leases.");
+        _healthCheckSchedulerPendingAdmissions = metrics.CreateGauge(
+            "nzbdav_health_check_scheduler_pending_admissions",
+            "Anonymous background gate admissions requested by the STAT scheduler.");
+        _healthCheckSchedulerRunnableSessions = metrics.CreateGauge(
+            "nzbdav_health_check_scheduler_runnable_sessions",
+            "Health-check sessions with undispatched STAT work.");
+        _healthCheckSchedulerSessions = metrics.CreateGauge(
+            "nzbdav_health_check_scheduler_sessions",
+            "Registered background STAT scheduler sessions by state.",
+            new GaugeConfiguration { LabelNames = ["state"] });
+        _healthCheckSchedulerPendingSegments = metrics.CreateGauge(
+            "nzbdav_health_check_scheduler_pending_segments",
+            "Undispatched background health-check STAT segments.");
+        _healthCheckSchedulerDispatches = metrics.CreateCounter(
+            "nzbdav_health_check_scheduler_dispatches_total",
+            "Background STAT assignments dispatched by the scheduler.");
+        _healthCheckSchedulerCompletions = metrics.CreateCounter(
+            "nzbdav_health_check_scheduler_completions_total",
+            "Background STAT assignments completed by the scheduler.");
+        _healthCheckSchedulerCancellations = metrics.CreateCounter(
+            "nzbdav_health_check_scheduler_cancellations_total",
+            "Background STAT sessions cancelled by the scheduler.");
+        _healthCheckSchedulerFailures = metrics.CreateCounter(
+            "nzbdav_health_check_scheduler_failures_total",
+            "Background STAT sessions failed by the scheduler.");
+        _healthCheckSchedulerProvider = metrics.CreateGauge(
+            "nzbdav_health_check_scheduler_provider",
+            "Provider-aware background STAT scheduler state by provider.",
+            new GaugeConfiguration { LabelNames = ["provider_key", "state"] });
+        _healthCheckSchedulerGlobalBlocked = metrics.CreateGauge(
+            "nzbdav_health_check_scheduler_global_blocked_sessions",
+            "Runnable health-check sessions held back by the explicit aggregate ceiling.");
+        _healthCheckSchedulerLegacyAssignments = metrics.CreateGauge(
+            "nzbdav_health_check_scheduler_legacy_assignments",
+            "Active background STAT assignments backed by a legacy shared-pool permit.");
+        _nntpEffectiveStatPipelineDepth = metrics.CreateGauge(
+            "nzbdav_nntp_effective_stat_pipeline_depth",
+            "UsenetSharp MaxPipelineDepth health STAT sweeps actually run at per provider. "
+            + "Independent of the provider's configured BODY/queue pipelining depth.",
+            new GaugeConfiguration { LabelNames = ["provider_key"] });
     }
 
     public static PrometheusMetrics? Current { get; set; }
@@ -178,6 +313,15 @@ public sealed class PrometheusMetrics
         _segmentFetches.WithLabels(providerKey, status).Inc();
         _segmentFetchDuration.WithLabels(providerKey).Observe(duration.TotalSeconds);
     }
+
+    public void RecordStatAttempt(string providerKey, string result, TimeSpan duration)
+    {
+        _statAttempts.WithLabels(providerKey, result).Inc();
+        _statAttemptDuration.WithLabels(providerKey, result).Observe(duration.TotalSeconds);
+    }
+
+    public void RecordStatWalk(string outcome, int attempts) =>
+        _statWalkDepth.WithLabels(outcome).Observe(attempts);
 
     public void RecordSeek(string kind, TimeSpan elapsed)
     {
@@ -205,6 +349,77 @@ public sealed class PrometheusMetrics
     public void RecordPar2PatchEviction() => _par2PatchEvictions.Inc();
 
     public void RecordStreamingCorruptSegment() => _streamingCorruptSegments.Inc();
+
+    internal void SetHealthCheckGate(HealthCheckConnectionGateSnapshot snapshot)
+    {
+        // 0 means Auto: no aggregate ceiling. An explicit ceiling is always >= 1.
+        _healthCheckGateLimit.Set(snapshot.Limit ?? 0);
+        _healthCheckGateActive.Set(snapshot.Active);
+        _healthCheckGatePeakActive.Set(snapshot.PeakActive);
+        _healthCheckGateWaiting.WithLabels("queue").Set(snapshot.WaitingQueue);
+        _healthCheckGateWaiting.WithLabels("background").Set(snapshot.WaitingBackground);
+        _healthCheckGatePeakWaiting.WithLabels("queue").Set(snapshot.PeakWaitingQueue);
+        _healthCheckGatePeakWaiting.WithLabels("background").Set(snapshot.PeakWaitingBackground);
+    }
+
+    internal void SetHealthCheckScheduler(HealthCheckStatSchedulerSnapshot snapshot)
+    {
+        // 0 means Auto: no aggregate ceiling. An explicit ceiling is always >= 1.
+        _healthCheckSchedulerCapacity.Set(snapshot.Capacity ?? 0);
+        _healthCheckSchedulerActive.Set(snapshot.ActiveAssignments);
+        _healthCheckSchedulerPendingAdmissions.Set(snapshot.PendingAdmissions);
+        _healthCheckSchedulerRunnableSessions.Set(snapshot.RunnableSessions);
+        foreach (var state in new[] { "running", "cancelling", "failed" })
+        {
+            _healthCheckSchedulerSessions.WithLabels(state).Set(snapshot.Sessions.Count(session =>
+                string.Equals(session.State, state, StringComparison.OrdinalIgnoreCase)));
+        }
+        _healthCheckSchedulerPendingSegments.Set(snapshot.PendingSegments);
+        _healthCheckSchedulerDispatches.IncTo(snapshot.Dispatches);
+        _healthCheckSchedulerCompletions.IncTo(snapshot.Completions);
+        _healthCheckSchedulerCancellations.IncTo(snapshot.Cancellations);
+        _healthCheckSchedulerFailures.IncTo(snapshot.Failures);
+        _healthCheckSchedulerGlobalBlocked.Set(snapshot.GlobalBlockedSessions);
+        _healthCheckSchedulerLegacyAssignments.Set(snapshot.LegacyCompatibilityAssignments);
+
+        // Provider keys are low-cardinality and already used by the pool metrics; run IDs,
+        // DAV item IDs, filenames, and message IDs must never become labels.
+        var providerKeys = snapshot.Providers.Select(provider => provider.ProviderKey).ToHashSet(
+            StringComparer.Ordinal);
+        foreach (var stale in _schedulerProviderKeys.Except(providerKeys).ToArray())
+        {
+            foreach (var state in SchedulerProviderStates)
+                _healthCheckSchedulerProvider.RemoveLabelled(stale, state);
+        }
+        _schedulerProviderKeys.Clear();
+        _schedulerProviderKeys.UnionWith(providerKeys);
+
+        foreach (var provider in snapshot.Providers)
+        {
+            var key = provider.ProviderKey;
+            _healthCheckSchedulerProvider.WithLabels(key, "active_assignments")
+                .Set(provider.ActiveAssignments);
+            _healthCheckSchedulerProvider.WithLabels(key, "runnable_sessions")
+                .Set(provider.RunnableSessions);
+            _healthCheckSchedulerProvider.WithLabels(key, "pending_segments")
+                .Set(provider.PendingSegments);
+            _healthCheckSchedulerProvider.WithLabels(key, "blocked_sessions")
+                .Set(provider.BlockedSessions);
+            _healthCheckSchedulerProvider.WithLabels(key, "legacy_shared_pool")
+                .Set(provider.IsLegacySharedPool ? 1 : 0);
+        }
+    }
+
+    private static readonly string[] SchedulerProviderStates =
+    [
+        "active_assignments",
+        "runnable_sessions",
+        "pending_segments",
+        "blocked_sessions",
+        "legacy_shared_pool",
+    ];
+
+    private readonly HashSet<string> _schedulerProviderKeys = new(StringComparer.Ordinal);
 
     public void Refresh(
         ActiveReadRegistry activeReads,
@@ -272,7 +487,7 @@ public sealed class PrometheusMetrics
         _providerKeys.UnionWith(currentKeys);
     }
 
-    private void SetPool(ProviderConnectionSnapshot pool)
+    internal void SetPool(ProviderConnectionSnapshot pool)
     {
         var key = pool.MetricsKey;
         _poolConnections.WithLabels(key, "live").Set(pool.LiveConnections);
@@ -280,9 +495,42 @@ public sealed class PrometheusMetrics
         _poolConnections.WithLabels(key, "active").Set(pool.ActiveConnections);
         _poolConnections.WithLabels(key, "available").Set(pool.AvailableConnections);
         _poolConnections.WithLabels(key, "pending").Set(pool.PendingSelections);
+        _nntpEffectiveStatPipelineDepth.WithLabels(key).Set(pool.EffectiveStatPipelineDepth);
+        _poolMaxConnections.WithLabels(key, "configured").Set(pool.ConfiguredMaxConnections);
         _poolMaxConnections.WithLabels(key, "effective").Set(pool.EffectiveMaxConnections);
         if (pool.LearnedConnectionLimit is { } learned)
             _poolMaxConnections.WithLabels(key, "learned").Set(learned);
+        else
+            _poolMaxConnections.RemoveLabelled(key, "learned");
+
+        if (pool.Admission is { } admission)
+        {
+            _poolConnections.WithLabels(key, "transfer_active").Set(admission.ActiveTransferOperations);
+            _poolConnections.WithLabels(key, "metadata_active").Set(admission.ActiveMetadataOperations);
+            _poolConnections.WithLabels(key, "transfer_waiting").Set(admission.WaitingTransferOperations);
+            _poolConnections.WithLabels(key, "metadata_waiting").Set(admission.WaitingMetadataOperations);
+            _poolMaxConnections.WithLabels(key, "transfer_configured").Set(admission.ConfiguredTransferLimit);
+            _poolMaxConnections.WithLabels(key, "transfer_effective").Set(admission.EffectiveTransferLimit);
+            _poolMaxConnections.WithLabels(key, "metadata_base").Set(admission.BaseMetadataCapacity);
+            _poolMaxConnections.WithLabels(key, "metadata_burst").Set(admission.MetadataBurstAllowance);
+            _poolMaxConnections.WithLabels(key, "metadata_max").Set(admission.MaxMetadataCapacity);
+        }
+        else
+        {
+            RemoveAdmissionMetrics(key);
+        }
+        if (pool.VerificationCoverage is { } coverage)
+        {
+            _verificationCoverageState.WithLabels(key).Set(
+                coverage.State == VerificationCoverageState.Deprioritized ? 1 : 0);
+            _verificationCoverageSamples.WithLabels(key).Set(coverage.Samples);
+            _verificationCoverageMissRate.WithLabels(key).Set(coverage.MissRate);
+            _verificationCoverageDeprioritizations.WithLabels(key).Set(coverage.Deprioritizations);
+        }
+        else
+        {
+            RemoveVerificationCoverageMetrics(key);
+        }
         _poolChurn.WithLabels(key, "opened").Set(pool.Churn.ConnectionsOpened);
         _poolChurn.WithLabels(key, "reused").Set(pool.Churn.ConnectionsReused);
         _poolChurn.WithLabels(key, "destroyed").Set(pool.Churn.ConnectionsDestroyed);
@@ -307,9 +555,17 @@ public sealed class PrometheusMetrics
 
     private void RemoveProvider(string key)
     {
-        foreach (var state in new[] { "live", "idle", "active", "available", "pending" })
+        foreach (var state in new[]
+                 {
+                     "live", "idle", "active", "available", "pending",
+                     "transfer_active", "metadata_active", "transfer_waiting", "metadata_waiting",
+                 })
             _poolConnections.RemoveLabelled(key, state);
-        foreach (var limit in new[] { "effective", "learned" })
+        foreach (var limit in new[]
+                 {
+                     "configured", "effective", "learned", "transfer_configured",
+                     "transfer_effective", "metadata_base", "metadata_burst", "metadata_max",
+                 })
             _poolMaxConnections.RemoveLabelled(key, limit);
         foreach (var churn in new[] { "opened", "reused", "destroyed", "stale_eviction", "handshake_failure" })
             _poolChurn.RemoveLabelled(key, churn);
@@ -318,5 +574,29 @@ public sealed class PrometheusMetrics
         _circuitTrips.RemoveLabelled(key);
         _circuitFailures.RemoveLabelled(key);
         _circuitArticleMisses.RemoveLabelled(key);
+        RemoveVerificationCoverageMetrics(key);
+    }
+
+    private void RemoveVerificationCoverageMetrics(string key)
+    {
+        _verificationCoverageState.RemoveLabelled(key);
+        _verificationCoverageSamples.RemoveLabelled(key);
+        _verificationCoverageMissRate.RemoveLabelled(key);
+        _verificationCoverageDeprioritizations.RemoveLabelled(key);
+    }
+
+    private void RemoveAdmissionMetrics(string key)
+    {
+        foreach (var state in new[]
+                 {
+                     "transfer_active", "metadata_active", "transfer_waiting", "metadata_waiting",
+                 })
+            _poolConnections.RemoveLabelled(key, state);
+        foreach (var limit in new[]
+                 {
+                     "transfer_configured", "transfer_effective", "metadata_base",
+                     "metadata_burst", "metadata_max",
+                 })
+            _poolMaxConnections.RemoveLabelled(key, limit);
     }
 }

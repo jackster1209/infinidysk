@@ -37,7 +37,8 @@ public sealed class SupportPackService(
     Repair.Par2RepairService par2RepairService,
     Repair.RepairPatchStore repairPatchStore,
     ConcurrentReadTracker? concurrentReadTracker = null,
-    IQueueCoordinator? queueCoordinator = null)
+    IQueueCoordinator? queueCoordinator = null,
+    HealthCheckStatScheduler? healthCheckStatScheduler = null)
 {
     private const long MinuteMs = 60_000;
     private const long HourMs = 60 * MinuteMs;
@@ -456,6 +457,7 @@ public sealed class SupportPackService(
                 processThreadCount = ProcessThreadCount(),
             },
             connections = BuildConnectionDiagnostics(),
+            healthScheduler = BuildHealthSchedulerDiagnostics(),
             storage = new
             {
                 configPath,
@@ -654,6 +656,9 @@ public sealed class SupportPackService(
     /// Live pool occupancy plus lifetime churn per provider. High
     /// <c>connectionsDestroyed</c> against low <c>connectionsReused</c> means connections
     /// are being replaced rather than pooled, and the handshake wait shows what that costs.
+    /// <c>verificationCoverage</c> explains health-check provider order: a
+    /// <c>deprioritized</c> provider is being tried later within its own configured tier
+    /// because it definitively missed most of what verification recently asked it for.
     /// </summary>
     private object BuildConnectionDiagnostics()
     {
@@ -671,7 +676,24 @@ public sealed class SupportPackService(
                     snapshot.AvailableConnections,
                     snapshot.PendingSelections,
                     snapshot.LearnedConnectionLimit,
+                    snapshot.ConfiguredMaxConnections,
                     snapshot.EffectiveMaxConnections,
+                    snapshot.EffectiveStatPipelineDepth,
+                    snapshot.ConfiguredPipelineDepth,
+                    admission = snapshot.Admission is null
+                        ? null
+                        : new
+                        {
+                            snapshot.Admission.ConfiguredTransferLimit,
+                            snapshot.Admission.EffectiveTransferLimit,
+                            snapshot.Admission.BaseMetadataCapacity,
+                            snapshot.Admission.MetadataBurstAllowance,
+                            snapshot.Admission.MaxMetadataCapacity,
+                            snapshot.Admission.ActiveTransferOperations,
+                            snapshot.Admission.ActiveMetadataOperations,
+                            snapshot.Admission.WaitingTransferOperations,
+                            snapshot.Admission.WaitingMetadataOperations,
+                        },
                     churn = new
                     {
                         snapshot.Churn.ConnectionsOpened,
@@ -682,6 +704,16 @@ public sealed class SupportPackService(
                         snapshot.Churn.GateWaitMs,
                         snapshot.Churn.HandshakeWaitMs,
                     },
+                    verificationCoverage = snapshot.VerificationCoverage is null
+                        ? null
+                        : new
+                        {
+                            state = snapshot.VerificationCoverage.State.ToString(),
+                            snapshot.VerificationCoverage.Samples,
+                            snapshot.VerificationCoverage.MissRate,
+                            snapshot.VerificationCoverage.Deprioritizations,
+                            snapshot.VerificationCoverage.LastTransitionUtc,
+                        },
                 })
                 .ToList<object>();
         }
@@ -689,6 +721,53 @@ public sealed class SupportPackService(
         {
             Log.Debug(e, "Support pack: could not read connection-pool diagnostics");
             return Array.Empty<object>();
+        }
+    }
+
+    /// <summary>
+    /// Provider-aware health scheduling state. <c>activeAssignments</c> counts work that
+    /// already owns executable provider admission, so comparing a provider's
+    /// <c>activeAssignments</c> against its <c>admission.maxMetadataCapacity</c> shows
+    /// whether health work is saturating that provider or merely idle because no session
+    /// targets it. <c>blockedSessions</c> and <c>globalBlockedSessions</c> separate
+    /// provider saturation from the explicit aggregate ceiling.
+    /// </summary>
+    private object? BuildHealthSchedulerDiagnostics()
+    {
+        if (healthCheckStatScheduler is null) return null;
+        try
+        {
+            var snapshot = healthCheckStatScheduler.GetSnapshot();
+            return new
+            {
+                ceiling = snapshot.Capacity,
+                ceilingMode = snapshot.Capacity is null ? "auto" : "explicit",
+                snapshot.ActiveAssignments,
+                snapshot.RunnableSessions,
+                snapshot.PendingSegments,
+                snapshot.GlobalBlockedSessions,
+                snapshot.LegacyCompatibilityAssignments,
+                snapshot.Dispatches,
+                snapshot.Completions,
+                snapshot.Cancellations,
+                snapshot.Failures,
+                providers = snapshot.Providers
+                    .Select(provider => new
+                    {
+                        provider.ProviderKey,
+                        provider.ActiveAssignments,
+                        provider.RunnableSessions,
+                        provider.PendingSegments,
+                        provider.BlockedSessions,
+                        provider.IsLegacySharedPool,
+                    })
+                    .ToList(),
+            };
+        }
+        catch (Exception e) when (e is not OutOfMemoryException)
+        {
+            Log.Debug(e, "Support pack: could not read health scheduler diagnostics");
+            return null;
         }
     }
 
