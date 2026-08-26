@@ -56,9 +56,21 @@ export function HealthTable({ isEnabled, healthCheckItems, verificationLoad }: H
               </thead>
               <tbody>
                 {healthCheckItems.map((item) => {
-                  const statSession = verificationLoad.scheduler.sessions.find(
+                  const statSessions = verificationLoad.scheduler.sessions.filter(
                     (session) => session.davItemId === item.id,
                   );
+                  const statActivity =
+                    statSessions.length > 0
+                      ? statSessions.reduce(
+                          (summary, session) => ({
+                            inFlight: summary.inFlight + session.inFlight,
+                            completed: summary.completed + session.completed,
+                            total: summary.total + session.total,
+                            acceptingInput: summary.acceptingInput || !session.inputCompleted,
+                          }),
+                          { inFlight: 0, completed: 0, total: 0, acceptingInput: false },
+                        )
+                      : null;
                   return (
                     <tr key={item.id} className="border-base-content/10">
                       <td className="max-w-[280px] py-3 pl-4 align-middle md:pl-6 max-[899px]:max-w-none">
@@ -69,11 +81,12 @@ export function HealthTable({ isEnabled, healthCheckItems, verificationLoad }: H
                           <div className="break-all text-xs leading-snug text-base-content/45">
                             <Truncate>{item.path}</Truncate>
                           </div>
-                          {statSession && (
+                          {statActivity && (
                             <div className="font-mono text-[11px] tabular-nums text-info/75">
-                              {statSession.inFlight} active STAT ·{" "}
-                              {statSession.completed.toLocaleString()} /{" "}
-                              {statSession.total.toLocaleString()} complete
+                              {statActivity.inFlight} active STAT ·{" "}
+                              {statActivity.completed.toLocaleString()} /{" "}
+                              {statActivity.total.toLocaleString()} provider checks
+                              {statActivity.acceptingInput ? " · streaming fallback" : ""}
                             </div>
                           )}
                           <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 min-[900px]:hidden">

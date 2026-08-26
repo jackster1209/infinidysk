@@ -63,4 +63,6 @@ public class HealthCheckStatSessionResponse
     public int InFlight { get; init; }
     public int Completed { get; init; }
     public int Total { get; init; }
+    /// <summary>False while upstream provider batches may still append fallback work.</summary>
+    public bool InputCompleted { get; init; }
 }

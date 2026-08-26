@@ -15,6 +15,30 @@ dotnet run --project backend.Benchmarks -c Release
 Use the same machine and runtime when comparing BenchmarkDotNet results across
 UsenetSharp or streaming changes.
 
+## Health verification failover regression procedure
+
+The PR-blocking architectural proof is deterministic rather than clock-based:
+`HealthCheckDegradedClassificationTests.ProviderFailover_StreamsCompletedChunksBeforeUpstreamPhaseFinishes`
+blocks one Provider A batch and verifies that Provider B starts from other completed misses before A
+is released. Scheduler tests separately pin run-scoped fairness, provider/global admission release,
+and incremental-session completion. These tests prove overlap and resource ownership without a
+machine-dependent seconds threshold.
+
+For a real-provider A/B, use the same large NZB, provider order, connection budgets, health depth,
+and cache state on current `main` and the candidate commit. Enable Debug logging and record the
+structured `Health verification pipeline` and `Health verification provider stage` events. Compare:
+
+- total, primary, and fallback elapsed milliseconds;
+- logical input versus source positions (duplicate IDs are collapsed);
+- per-provider queue input, batches/items, and cumulative execution milliseconds;
+- exists, definitive-missing, unanswered, and forwarded counts; and
+- the Health page's aggregate active provider checks during the fallback tail.
+
+Provider latency and article distribution are external, so this is a same-environment comparison,
+not a universal elapsed-time gate. The expected architectural signal is that later-provider batches
+begin before the primary stage completes and useful active work no longer structurally collapses
+into per-article fallback walks.
+
 ## NNTP decoded BODY (`NntpDecodedBodyBenchmarks`)
 
 This measures the playback decode path in

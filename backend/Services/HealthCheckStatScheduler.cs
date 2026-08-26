@@ -79,7 +79,8 @@ public sealed record HealthCheckStatSessionSnapshot(
     string State,
     int InFlight,
     int Completed,
-    int Total);
+    int Total,
+    bool InputCompleted);
 
 /// <summary>
 /// Per-provider scheduler state. Providers are the resource health work is allocated from,
@@ -894,7 +895,8 @@ public sealed class HealthCheckStatScheduler : BackgroundService
                 session.Status.ToString(),
                 session.InFlight,
                 session.Completed,
-                session.SegmentIds.Count))
+                session.SegmentIds.Count,
+                session.InputCompleted))
             .ToArray();
         var runnable = _sessions.Values.Count(session =>
             session.Status == SessionStatus.Running

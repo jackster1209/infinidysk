@@ -1,4 +1,5 @@
 ﻿using System.Collections.Concurrent;
+using System.Diagnostics;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Hosting;
 using NzbWebDAV.Clients.RadarrSonarr;
@@ -1054,6 +1055,13 @@ public class HealthCheckService : BackgroundService
 
         using var sweepCts = ContextualCancellationTokenSource.CreateLinkedTokenSource(
             statCts.Token);
+        var pipelineStarted = Stopwatch.GetTimestamp();
+        var primaryCompleted = 0L;
+        var firstFallbackStarted = 0L;
+        var stageDiagnostics = order
+            .Select(provider => new ProviderSweepDiagnostics(provider.ProviderKey))
+            .ToArray();
+        stageDiagnostics[0].AddQueueInput(total);
         var sessions = new HealthCheckStatScheduler.IncrementalSession[order.Count];
         var buffers = new HealthCheckFailoverBuffer[order.Count - 1];
         var indeterminate = new HashSet<string>(StringComparer.Ordinal);
@@ -1064,7 +1072,9 @@ public class HealthCheckService : BackgroundService
         // scheduler treats this pipeline as one fairness claimant.
         for (var phase = order.Count - 1; phase >= 0; phase--)
         {
+            var phaseIndex = phase;
             var providerKey = order[phase].ProviderKey;
+            var diagnostics = stageDiagnostics[phaseIndex];
             HealthCheckFailoverBuffer? downstream = null;
             if (phase < order.Count - 1)
             {
@@ -1084,10 +1094,27 @@ public class HealthCheckService : BackgroundService
                     providerKey),
                 async (chunk, chunkProgress, chunkCt) =>
                 {
-                    var sweep = await _usenetClient.SweepProviderPipelinedAsync(
-                            providerKey, chunk, depth: 0, chunkProgress, chunkCt)
-                        .ConfigureAwait(false);
-                    return new HealthCheckStatChunkResult(sweep.Missing, sweep.Unanswered);
+                    if (phaseIndex > 0)
+                    {
+                        Interlocked.CompareExchange(
+                            ref firstFallbackStarted,
+                            Stopwatch.GetTimestamp(),
+                            comparand: 0);
+                    }
+                    diagnostics.StartBatch(chunk.Count);
+                    var executionStarted = Stopwatch.GetTimestamp();
+                    try
+                    {
+                        var sweep = await _usenetClient.SweepProviderPipelinedAsync(
+                                providerKey, chunk, depth: 0, chunkProgress, chunkCt)
+                            .ConfigureAwait(false);
+                        return new HealthCheckStatChunkResult(sweep.Missing, sweep.Unanswered);
+                    }
+                    finally
+                    {
+                        diagnostics.CompleteBatchExecution(
+                            Stopwatch.GetTimestamp() - executionStarted);
+                    }
                 },
                 completion =>
                 {
@@ -1098,12 +1125,20 @@ public class HealthCheckService : BackgroundService
                     var unresolved = completion.SegmentIds
                         .Where(unresolvedIds.Contains)
                         .ToArray();
+                    diagnostics.RecordResults(
+                        completion.SegmentIds.Count - unresolved.Length,
+                        completion.MissingIds.Count,
+                        completion.UnansweredIds.Count,
+                        downstream is null ? 0 : unresolved.Length);
                     sweepProgress.AdvanceTerminal(
                         downstream is null
                             ? completion.SegmentIds.Count
                             : completion.SegmentIds.Count - unresolved.Length);
                     if (downstream is not null)
+                    {
+                        stageDiagnostics[phaseIndex + 1].AddQueueInput(unresolved.Length);
                         downstream.Add(unresolved);
+                    }
                     else
                         finalUnresolved.UnionWith(unresolved);
                 },
@@ -1118,6 +1153,8 @@ public class HealthCheckService : BackgroundService
             for (var phase = 0; phase < sessions.Length; phase++)
             {
                 await sessions[phase].Completion.ConfigureAwait(false);
+                if (phase == 0)
+                    primaryCompleted = Stopwatch.GetTimestamp();
                 if (phase >= buffers.Length) continue;
                 await buffers[phase].CompleteAsync().ConfigureAwait(false);
                 await sessions[phase + 1].CompleteInputAsync().ConfigureAwait(false);
@@ -1144,6 +1181,16 @@ public class HealthCheckService : BackgroundService
                     // Drain cancellation so every scheduler lease is released before unwind.
                 }
             }
+            LogSweepDiagnostics(
+                "failed",
+                davItemId,
+                segmentIds.Count,
+                total,
+                pipelineStarted,
+                primaryCompleted,
+                firstFallbackStarted,
+                finalUnresolved.Count,
+                stageDiagnostics);
             throw;
         }
 
@@ -1153,12 +1200,32 @@ public class HealthCheckService : BackgroundService
             var segmentId = remaining.FirstOrDefault(indeterminate.Contains);
             if (segmentId is not null)
             {
+                LogSweepDiagnostics(
+                    "indeterminate",
+                    davItemId,
+                    segmentIds.Count,
+                    total,
+                    pipelineStarted,
+                    primaryCompleted,
+                    firstFallbackStarted,
+                    remaining.Length,
+                    stageDiagnostics);
                 throw new UsenetUnexpectedResponseException(
                     segmentId,
                     "one or more providers did not return a definitive STAT response");
             }
         }
 
+        LogSweepDiagnostics(
+            "completed",
+            davItemId,
+            segmentIds.Count,
+            total,
+            pipelineStarted,
+            primaryCompleted,
+            firstFallbackStarted,
+            remaining.Length,
+            stageDiagnostics);
         return remaining;
     }
 
@@ -1192,6 +1259,105 @@ public class HealthCheckService : BackgroundService
     private sealed record HealthSweepResult(
         IReadOnlyList<string> Missing,
         IReadOnlyList<string> Unanswered);
+
+    private static void LogSweepDiagnostics(
+        string outcome,
+        Guid davItemId,
+        int sourcePositions,
+        int logicalInput,
+        long pipelineStarted,
+        long primaryCompleted,
+        long firstFallbackStarted,
+        int finalUnresolved,
+        IReadOnlyList<ProviderSweepDiagnostics> stages)
+    {
+        var completedAt = Stopwatch.GetTimestamp();
+        Log.Debug(
+            "Health verification pipeline {Outcome} for {DavItemId}. " +
+            "SourcePositions={SourcePositions} LogicalInput={LogicalInput} " +
+            "FinalUnresolved={FinalUnresolved} ProviderStages={ProviderStages} " +
+            "TotalElapsedMs={TotalElapsedMs:F1} PrimaryElapsedMs={PrimaryElapsedMs:F1} " +
+            "FallbackElapsedMs={FallbackElapsedMs:F1}",
+            outcome,
+            davItemId,
+            sourcePositions,
+            logicalInput,
+            finalUnresolved,
+            stages.Count,
+            Stopwatch.GetElapsedTime(pipelineStarted, completedAt).TotalMilliseconds,
+            primaryCompleted == 0
+                ? 0
+                : Stopwatch.GetElapsedTime(pipelineStarted, primaryCompleted).TotalMilliseconds,
+            firstFallbackStarted == 0
+                ? 0
+                : Stopwatch.GetElapsedTime(firstFallbackStarted, completedAt).TotalMilliseconds);
+
+        foreach (var stage in stages)
+        {
+            Log.Debug(
+                "Health verification provider stage for {DavItemId}. ProviderKey={ProviderKey} " +
+                "QueueInput={QueueInput} BatchesStarted={BatchesStarted} " +
+                "BatchItems={BatchItems} ExecutionElapsedMs={ExecutionElapsedMs:F1} " +
+                "Exists={Exists} DefinitiveMissing={DefinitiveMissing} " +
+                "Unanswered={Unanswered} Forwarded={Forwarded}",
+                davItemId,
+                stage.ProviderKey,
+                stage.QueueInput,
+                stage.BatchesStarted,
+                stage.BatchItems,
+                stage.ExecutionElapsedMilliseconds,
+                stage.Exists,
+                stage.DefinitiveMissing,
+                stage.Unanswered,
+                stage.Forwarded);
+        }
+    }
+
+    private sealed class ProviderSweepDiagnostics(string providerKey)
+    {
+        private long _queueInput;
+        private long _batchesStarted;
+        private long _batchItems;
+        private long _executionTimestampTicks;
+        private long _exists;
+        private long _definitiveMissing;
+        private long _unanswered;
+        private long _forwarded;
+
+        public string ProviderKey { get; } = providerKey;
+        public long QueueInput => Volatile.Read(ref _queueInput);
+        public long BatchesStarted => Volatile.Read(ref _batchesStarted);
+        public long BatchItems => Volatile.Read(ref _batchItems);
+        public double ExecutionElapsedMilliseconds =>
+            Volatile.Read(ref _executionTimestampTicks) * 1000d / Stopwatch.Frequency;
+        public long Exists => Volatile.Read(ref _exists);
+        public long DefinitiveMissing => Volatile.Read(ref _definitiveMissing);
+        public long Unanswered => Volatile.Read(ref _unanswered);
+        public long Forwarded => Volatile.Read(ref _forwarded);
+
+        public void AddQueueInput(int count) => Interlocked.Add(ref _queueInput, count);
+
+        public void StartBatch(int itemCount)
+        {
+            Interlocked.Increment(ref _batchesStarted);
+            Interlocked.Add(ref _batchItems, itemCount);
+        }
+
+        public void CompleteBatchExecution(long timestampTicks) =>
+            Interlocked.Add(ref _executionTimestampTicks, timestampTicks);
+
+        public void RecordResults(
+            int exists,
+            int definitiveMissing,
+            int unanswered,
+            int forwarded)
+        {
+            Interlocked.Add(ref _exists, exists);
+            Interlocked.Add(ref _definitiveMissing, definitiveMissing);
+            Interlocked.Add(ref _unanswered, unanswered);
+            Interlocked.Add(ref _forwarded, forwarded);
+        }
+    }
 
     private async Task<List<int>> ConfirmHolesThroughFallbacksAsync(
         Guid runId,

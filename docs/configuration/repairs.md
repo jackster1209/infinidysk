@@ -39,9 +39,9 @@ therefore do not need to be changed before starting the new version.
 
 ## Provider-aware health scheduling [since 1.4.0](https://github.com/infinidysk/infinidysk/releases/tag/v1.4.0){ .nzbdav-since }
 
-Health verification is scheduled against the provider it actually targets. Each verification phase
-names one provider, and a check is only started once that provider can execute it — so background
-health work no longer piles up waiting inside a provider's admission queue.
+Health verification is scheduled against the provider it actually targets. Every scheduler
+assignment names one provider and starts only when that provider can execute it, so background
+health work does not pile up waiting inside a provider's admission queue.
 
 This makes `repair.healthcheck-concurrency` a **ceiling**, not a target:
 
@@ -65,6 +65,25 @@ split Transfer/Metadata connection model. Pending playback-triggered urgent repa
 priority but wait until the queue is idle. If routine verification discovers repair work while the
 queue remains active, it waits for up to five minutes and then records an Action Needed result for a
 retry 15 minutes later. Repair work that has already started is allowed to finish.
+
+### Streaming batched failover
+
+Large checks keep fallback verification pipelined instead of turning every primary miss into an
+independent provider walk. Completed provider-local batches immediately feed their unresolved
+Message-IDs into the next eligible provider session, so that provider can start while an earlier
+provider is still checking later batches. Each physical batch still crosses the same scheduler,
+provider Metadata budget, global ceiling (when configured), circuit breaker, and connection pool.
+
+Repeated Message-IDs are verified once logically and their result is applied to every source
+position. An unanswered or unavailable provider remains different from a definitive NNTP miss;
+uncertain checks are deferred rather than reported as missing. The small downstream coalescing
+window and its 64-ID useful-batch threshold are internal implementation details, not settings; the
+existing 256-ID scheduler assignment cap remains the physical upper bound.
+
+Health progress counts logical Message-IDs that have reached a terminal result. An active check can
+therefore show 0%, advances according to genuinely resolved work, and reserves 100% for the final
+health-check completion event. The scheduler detail beneath an item is separate physical-work
+diagnostics: it aggregates active and completed provider checks across every streaming session.
 
 ## Re-check after provider changes [since 1.2.0](https://github.com/infinidysk/infinidysk/releases/tag/v1.2.0){ .nzbdav-since }
 

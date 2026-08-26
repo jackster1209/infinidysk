@@ -67,22 +67,23 @@ public sealed class GetHealthCheckGateControllerTests
         await scheduler.StartAsync(CancellationToken.None);
         using var cancellation = new CancellationTokenSource();
         var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var run = scheduler.RunAsync(
-            new HealthCheckStatRequest(
+        var session = scheduler.OpenDetailedSession(
+            new HealthCheckStatSessionRequest(
                 Guid.NewGuid(),
                 Guid.NewGuid(),
                 0,
-                ["segment"],
                 HealthCheckStatMode.CollectMissing,
                 "provider-a"),
             async (_, _, ct) =>
             {
                 started.TrySetResult();
                 await Task.Delay(Timeout.InfiniteTimeSpan, ct);
-                return [];
+                return new HealthCheckStatChunkResult([], []);
             },
+            chunkObserver: null,
             progress: null,
             cancellation.Token);
+        await session.AppendAsync(["segment"]);
         await started.Task.WaitAsync(TimeSpan.FromSeconds(1));
 
         var controller = new TestController(gate, scheduler, config)
@@ -96,10 +97,12 @@ public sealed class GetHealthCheckGateControllerTests
         var response = Assert.IsType<OkObjectResult>(result).Value as GetHealthCheckGateResponse
             ?? throw new Xunit.Sdk.XunitException("Expected health check gate response.");
 
-        Assert.Equal("provider-a", Assert.Single(response.Scheduler.Sessions).ProviderKey);
+        var responseSession = Assert.Single(response.Scheduler.Sessions);
+        Assert.Equal("provider-a", responseSession.ProviderKey);
+        Assert.False(responseSession.InputCompleted);
 
         await cancellation.CancelAsync();
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => run);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => session.Completion);
         await scheduler.StopAsync(CancellationToken.None);
     }
 

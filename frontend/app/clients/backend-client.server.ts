@@ -934,6 +934,8 @@ export type HealthCheckStatSessionSnapshot = {
   inFlight: number;
   completed: number;
   total: number;
+  /** False while an upstream provider may still append fallback work. */
+  inputCompleted: boolean;
 };
 
 export type HealthCheckQueueItem = {

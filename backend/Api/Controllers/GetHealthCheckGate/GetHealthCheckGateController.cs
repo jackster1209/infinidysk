@@ -72,6 +72,7 @@ public class GetHealthCheckGateController(
                         InFlight = session.InFlight,
                         Completed = session.Completed,
                         Total = session.Total,
+                        InputCompleted = session.InputCompleted,
                     })
                     .ToArray(),
             },

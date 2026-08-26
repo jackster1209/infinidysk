@@ -82,6 +82,20 @@ describe("HealthTable", () => {
                 inFlight: 7,
                 completed: 125,
                 total: 1_000,
+                inputCompleted: true,
+              },
+              {
+                runId: "run-1",
+                davItemId: "item-1",
+                phaseId: 1,
+                providerKey: "provider-b",
+                providerLabel: "provider-b",
+                mode: "VerifyAll",
+                state: "Running",
+                inFlight: 2,
+                completed: 50,
+                total: 100,
+                inputCompleted: false,
               },
             ],
           },
@@ -92,7 +106,7 @@ describe("HealthTable", () => {
     expect(markup).toContain("Verification load");
     expect(markup).toContain("18 / 50 active");
     expect(markup).not.toContain("Recent peak");
-    expect(markup).toContain("7 active STAT · 125 / 1,000 complete");
+    expect(markup).toContain("9 active STAT · 175 / 1,100 provider checks · streaming fallback");
     expect(markup).toContain('value="36"');
 
     // Admission queue depth and scheduler internals are diagnostics, not something the
