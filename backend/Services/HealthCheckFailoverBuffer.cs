@@ -79,22 +79,41 @@ internal sealed class HealthCheckFailoverBuffer
 
     private async Task FillPartialBufferAsync(List<string> pending)
     {
-        var delay = Task.Delay(PartialFlushDelay, _timeProvider, _cancellationToken);
-        while (pending.Count < UsefulBatchSize)
+        using var fillCts = CancellationTokenSource.CreateLinkedTokenSource(_cancellationToken);
+        Task<bool>? inputAvailable = null;
+        try
         {
-            while (pending.Count < UsefulBatchSize && _input.Reader.TryRead(out var next))
-                pending.AddRange(next);
-            if (pending.Count >= UsefulBatchSize) return;
-
-            var inputAvailable = _input.Reader.WaitToReadAsync(_cancellationToken).AsTask();
-            var completed = await Task.WhenAny(delay, inputAvailable).ConfigureAwait(false);
-            if (completed == delay)
+            var delay = Task.Delay(PartialFlushDelay, _timeProvider, fillCts.Token);
+            while (pending.Count < UsefulBatchSize)
             {
-                await delay.ConfigureAwait(false);
-                return;
-            }
+                while (pending.Count < UsefulBatchSize && _input.Reader.TryRead(out var next))
+                    pending.AddRange(next);
+                if (pending.Count >= UsefulBatchSize) return;
 
-            if (!await inputAvailable.ConfigureAwait(false)) return;
+                inputAvailable = _input.Reader.WaitToReadAsync(fillCts.Token).AsTask();
+                var completed = await Task.WhenAny(delay, inputAvailable).ConfigureAwait(false);
+                if (completed == delay)
+                {
+                    await delay.ConfigureAwait(false);
+                    return;
+                }
+
+                var hasInput = await inputAvailable.ConfigureAwait(false);
+                inputAvailable = null;
+                if (!hasInput) return;
+            }
+        }
+        finally
+        {
+            await fillCts.CancelAsync().ConfigureAwait(false);
+            if (inputAvailable is not null)
+            {
+                try { await inputAvailable.ConfigureAwait(false); }
+                catch (OperationCanceledException) when (fillCts.IsCancellationRequested)
+                {
+                    // Release the channel waiter's cancellation registration when the timer wins.
+                }
+            }
         }
     }
 }

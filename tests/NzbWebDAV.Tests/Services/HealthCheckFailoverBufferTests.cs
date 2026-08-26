@@ -57,6 +57,63 @@ public sealed class HealthCheckFailoverBufferTests
         await buffer.CompleteAsync();
     }
 
+    [Fact]
+    public async Task CompleteAsync_FlushesPendingPartialBatchWithoutWaitingForTimer()
+    {
+        var timeProvider = new ManualTimeProvider();
+        var appended = new TaskCompletionSource<IReadOnlyList<string>>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var buffer = new HealthCheckFailoverBuffer(
+            ids =>
+            {
+                appended.TrySetResult(ids);
+                return Task.CompletedTask;
+            },
+            timeProvider,
+            CancellationToken.None);
+
+        buffer.Add(["segment-0", "segment-1"]);
+        var completion = buffer.CompleteAsync();
+
+        Assert.Equal(["segment-0", "segment-1"], await appended.Task.WaitAsync(TestTimeout));
+        await completion.WaitAsync(TestTimeout);
+        Assert.Equal(0, timeProvider.ActiveTimers);
+    }
+
+    [Fact]
+    public async Task Add_AfterCompletionIsRejected()
+    {
+        var buffer = new HealthCheckFailoverBuffer(
+            _ => Task.CompletedTask,
+            TimeProvider.System,
+            CancellationToken.None);
+
+        await buffer.CompleteAsync();
+
+        var exception = Assert.Throws<InvalidOperationException>(
+            () => buffer.Add(["too-late"]));
+        Assert.Contains("no longer accepting work", exception.Message);
+    }
+
+    [Fact]
+    public async Task AppendFailure_PropagatesFromCompletionAndRejectsLaterWork()
+    {
+        var expected = new InvalidOperationException("downstream append failed");
+        var buffer = new HealthCheckFailoverBuffer(
+            _ => Task.FromException(expected),
+            TimeProvider.System,
+            CancellationToken.None);
+        buffer.Add(Enumerable.Range(0, HealthCheckFailoverBuffer.UsefulBatchSize)
+            .Select(index => $"segment-{index}")
+            .ToArray());
+
+        var actual = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => buffer.CompleteAsync());
+
+        Assert.Same(expected, actual);
+        Assert.Throws<InvalidOperationException>(() => buffer.Add(["too-late"]));
+    }
+
     private static async Task WaitUntilAsync(Func<bool> predicate)
     {
         var deadline = DateTimeOffset.UtcNow + TestTimeout;
