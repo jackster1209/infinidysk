@@ -1,10 +1,14 @@
-import type { HealthCheckQueueItem } from "~/clients/backend-client.server";
+import type {
+  HealthCheckGateSnapshot,
+  HealthCheckQueueItem,
+} from "~/clients/backend-client.server";
 import { Truncate } from "~/components/truncate/truncate";
 import { Badge, Icon } from "~/components/ui";
 
 export type HealthTableProps = {
   isEnabled: boolean;
   healthCheckItems: HealthCheckQueueItem[];
+  verificationLoad: HealthCheckGateSnapshot;
 };
 
 const desktopHeaderClass =
@@ -12,7 +16,7 @@ const desktopHeaderClass =
 const desktopCellClass =
   "hidden min-[900px]:table-cell max-w-[160px] whitespace-nowrap px-1 py-3 text-center align-middle font-mono text-xs tabular-nums text-base-content/70";
 
-export function HealthTable({ isEnabled, healthCheckItems }: HealthTableProps) {
+export function HealthTable({ isEnabled, healthCheckItems, verificationLoad }: HealthTableProps) {
   return (
     <section className="card w-full border border-base-content/10 bg-base-100 shadow-sm">
       <div className="card-body gap-0 p-0">
@@ -24,6 +28,8 @@ export function HealthTable({ isEnabled, healthCheckItems }: HealthTableProps) {
             </Badge>
           )}
         </div>
+
+        {isEnabled && <VerificationLoad snapshot={verificationLoad} />}
 
         {!isEnabled ? (
           <EmptyState
@@ -49,49 +55,149 @@ export function HealthTable({ isEnabled, healthCheckItems }: HealthTableProps) {
                 </tr>
               </thead>
               <tbody>
-                {healthCheckItems.map((item) => (
-                  <tr key={item.id} className="border-base-content/10">
-                    <td className="max-w-[280px] py-3 pl-4 align-middle md:pl-6 max-[899px]:max-w-none">
-                      <div className="flex min-w-0 flex-col gap-1">
-                        <div className="break-all text-sm font-medium leading-snug text-base-content">
-                          <Truncate>{item.name}</Truncate>
+                {healthCheckItems.map((item) => {
+                  const statSession = verificationLoad.scheduler.sessions.find(
+                    (session) => session.davItemId === item.id,
+                  );
+                  return (
+                    <tr key={item.id} className="border-base-content/10">
+                      <td className="max-w-[280px] py-3 pl-4 align-middle md:pl-6 max-[899px]:max-w-none">
+                        <div className="flex min-w-0 flex-col gap-1">
+                          <div className="break-all text-sm font-medium leading-snug text-base-content">
+                            <Truncate>{item.name}</Truncate>
+                          </div>
+                          <div className="break-all text-xs leading-snug text-base-content/45">
+                            <Truncate>{item.path}</Truncate>
+                          </div>
+                          {statSession && (
+                            <div className="font-mono text-[11px] tabular-nums text-info/75">
+                              {statSession.inFlight} active STAT ·{" "}
+                              {statSession.completed.toLocaleString()} /{" "}
+                              {statSession.total.toLocaleString()} complete
+                            </div>
+                          )}
+                          <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 min-[900px]:hidden">
+                            <MetaChip
+                              label="Created"
+                              value={formatAge(item.releaseDate, "Unknown")}
+                            />
+                            <MetaChip
+                              label="Last"
+                              value={formatAge(item.lastHealthCheck, "Never")}
+                            />
+                            <MetaChip
+                              label="Next"
+                              value={
+                                item.progress != null && item.progress > 0
+                                  ? null
+                                  : formatWhen(item.nextHealthCheck, "ASAP")
+                              }
+                              {...(item.progress != null && item.progress > 0
+                                ? { progress: item.progress }
+                                : {})}
+                            />
+                          </div>
                         </div>
-                        <div className="break-all text-xs leading-snug text-base-content/45">
-                          <Truncate>{item.path}</Truncate>
-                        </div>
-                        <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 min-[900px]:hidden">
-                          <MetaChip
-                            label="Created"
-                            value={formatAge(item.releaseDate, "Unknown")}
-                          />
-                          <MetaChip label="Last" value={formatAge(item.lastHealthCheck, "Never")} />
-                          <MetaChip
-                            label="Next"
-                            value={
-                              item.progress > 0 ? null : formatWhen(item.nextHealthCheck, "ASAP")
-                            }
-                            {...(item.progress > 0 ? { progress: item.progress } : {})}
-                          />
-                        </div>
-                      </div>
-                    </td>
-                    <td className={desktopCellClass}>{formatAge(item.releaseDate, "Unknown")}</td>
-                    <td className={desktopCellClass}>{formatAge(item.lastHealthCheck, "Never")}</td>
-                    <td className={`${desktopCellClass} pr-4 md:pr-6`}>
-                      {item.progress > 0 ? (
-                        <HealthProgressBadge percentage={item.progress} />
-                      ) : (
-                        formatWhen(item.nextHealthCheck, "ASAP")
-                      )}
-                    </td>
-                  </tr>
-                ))}
+                      </td>
+                      <td className={desktopCellClass}>{formatAge(item.releaseDate, "Unknown")}</td>
+                      <td className={desktopCellClass}>
+                        {formatAge(item.lastHealthCheck, "Never")}
+                      </td>
+                      <td className={`${desktopCellClass} pr-4 md:pr-6`}>
+                        {item.progress != null && item.progress > 0 ? (
+                          <HealthProgressBadge percentage={item.progress} />
+                        ) : (
+                          formatWhen(item.nextHealthCheck, "ASAP")
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>
         )}
       </div>
     </section>
+  );
+}
+
+function VerificationLoad({ snapshot }: { snapshot: HealthCheckGateSnapshot }) {
+  // In Auto there is no aggregate ceiling to divide by: provider admission decides what is
+  // executable, so showing "N / ceiling" would imply a target that does not exist.
+  const ceiling = snapshot.limit;
+  const utilization =
+    ceiling !== null && ceiling > 0
+      ? Math.min(100, Math.round((snapshot.active / ceiling) * 100))
+      : null;
+
+  return (
+    <div className="grid gap-4 border-b border-base-content/10 bg-base-200/30 px-4 py-3 md:px-6">
+      <div className="min-w-0">
+        <div className="mb-1.5 flex items-center justify-between gap-3 text-xs">
+          <span className="inline-flex items-center gap-1.5 font-semibold text-base-content/70">
+            <Icon name="speed" className="!text-[16px] text-base-content/50" />
+            Verification load
+          </span>
+          {ceiling !== null && (
+            <span className="font-mono tabular-nums text-base-content/70">
+              {snapshot.active} / {ceiling} active
+            </span>
+          )}
+        </div>
+        {utilization !== null ? (
+          <progress
+            aria-label="Active health-check verification connections"
+            className="progress progress-info h-1.5 w-full"
+            value={utilization}
+            max={100}
+          />
+        ) : (
+          // No ceiling means no bar to read the load off, so the live count carries it.
+          <div className="flex flex-col gap-0.5 text-[11px] leading-relaxed">
+            <span className="text-base-content/45">Capacity: Auto (provider-aware)</span>
+            <span className="font-mono tabular-nums text-base-content/70">
+              {snapshot.active} active
+            </span>
+          </div>
+        )}
+      </div>
+      {snapshot.scheduler.providers.length > 0 && (
+        <ProviderCapacity scheduler={snapshot.scheduler} />
+      )}
+    </div>
+  );
+}
+
+/**
+ * Health work is allocated per provider, so an idle provider is only a problem if a session
+ * actually targets it. Showing the breakdown keeps that distinction visible.
+ */
+function ProviderCapacity({
+  scheduler,
+}: {
+  scheduler: HealthCheckGateSnapshot["scheduler"];
+}) {
+  return (
+    <div className="mt-1 flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-base-content/45">
+      {scheduler.providers.map((provider) => (
+        <span key={provider.providerKey} className="font-mono tabular-nums">
+          <span className="text-base-content/60">{provider.providerLabel}</span>{" "}
+          {provider.activeAssignments} active
+          {provider.blockedSessions > 0 && (
+            <span className="text-warning"> · {provider.blockedSessions} waiting on provider</span>
+          )}
+          {provider.isLegacySharedPool && (
+            <span className="text-base-content/35"> · shared pool</span>
+          )}
+        </span>
+      ))}
+      {scheduler.globalBlockedSessions > 0 && (
+        <span className="font-mono tabular-nums text-warning">
+          {scheduler.globalBlockedSessions} waiting on ceiling
+        </span>
+      )}
+    </div>
   );
 }
 

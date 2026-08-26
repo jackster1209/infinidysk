@@ -449,6 +449,16 @@ class BackendClient {
     );
   }
 
+  public async getHealthCheckGate(): Promise<HealthCheckGateSnapshot> {
+    return await call<HealthCheckGateSnapshot>(
+      adminApi.getHealthCheckGate,
+      "Failed to get health check verification load",
+      {
+        method: "GET",
+      },
+    );
+  }
+
   public async getWatchdogEntries(limit: number = 200): Promise<WatchdogEntry[]> {
     const data = await call<{ entries?: WatchdogEntry[] }>(
       `${adminApi.getWatchdogEntries}?limit=${limit}`,
@@ -866,6 +876,66 @@ export type HealthCheckQueueResponse = {
   items: HealthCheckQueueItem[];
 };
 
+export type HealthCheckGateSnapshot = {
+  /** Explicit aggregate ceiling, or null in Auto (provider-aware) mode. */
+  limit: number | null;
+  ceilingMode: "auto" | "explicit";
+  active: number;
+  peakActive: number;
+  waitingQueue: number;
+  waitingBackground: number;
+  peakWaitingQueue: number;
+  peakWaitingBackground: number;
+  scheduler: HealthCheckStatSchedulerSnapshot;
+};
+
+export type HealthCheckStatSchedulerSnapshot = {
+  /** Explicit aggregate ceiling, or null in Auto (provider-aware) mode. */
+  capacity: number | null;
+  activeAssignments: number;
+  pendingAdmissions: number;
+  runnableSessions: number;
+  pendingSegments: number;
+  dispatches: number;
+  completions: number;
+  cancellations: number;
+  failures: number;
+  sessions: HealthCheckStatSessionSnapshot[];
+  providers: HealthCheckStatProviderSnapshot[];
+  /** Runnable sessions held back by the explicit aggregate ceiling. */
+  globalBlockedSessions: number;
+  /** Active assignments backed by a legacy shared-pool permit. */
+  legacyCompatibilityAssignments: number;
+};
+
+export type HealthCheckStatProviderSnapshot = {
+  /** Stable provider identity used by scheduling and metrics. */
+  providerKey: string;
+  /** Human-facing name for display: nickname, else host, else key. */
+  providerLabel: string;
+  activeAssignments: number;
+  runnableSessions: number;
+  pendingSegments: number;
+  /** Runnable sessions held back because this provider cannot admit more work. */
+  blockedSessions: number;
+  isLegacySharedPool: boolean;
+};
+
+export type HealthCheckStatSessionSnapshot = {
+  runId: string;
+  davItemId: string;
+  phaseId: number;
+  /** Stable provider identity used by scheduling and metrics. */
+  providerKey: string | null;
+  /** Human-facing name for display: nickname, else host, else key. */
+  providerLabel: string | null;
+  mode: string;
+  state: string;
+  inFlight: number;
+  completed: number;
+  total: number;
+};
+
 export type HealthCheckQueueItem = {
   id: string;
   name: string;
@@ -873,7 +943,7 @@ export type HealthCheckQueueItem = {
   releaseDate: string | null;
   lastHealthCheck: string | null;
   nextHealthCheck: string | null;
-  progress: number;
+  progress?: number;
 };
 
 export type HealthCheckHistoryResponse = {

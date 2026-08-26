@@ -17,6 +17,8 @@ export function LiveUsenetConnections({ hasUsenetProviders }: LiveUsenetConnecti
   const max = Number(parts[4]);
   const idle = Number(parts[5]);
   const active = live - idle;
+  const hasSplitSummary = parts[6] === "1";
+  const transferActive = Number(parts[7] ?? 0);
 
   useWebsocketTopic(
     "cxs",
@@ -71,6 +73,13 @@ export function LiveUsenetConnections({ hasUsenetProviders }: LiveUsenetConnecti
   const showConnecting = hasUsenetProviders && !connections;
   const showReconnecting = hasUsenetProviders && !!connections && transportDown;
 
+  const activeLabel =
+    (hasSplitSummary ? `${transferActive} transfer` : `${active} active`) +
+    (idle > 0 ? ` · ${idle} warm` : "");
+  const activeTitle = hasSplitSummary
+    ? "Active transfer connections on pooled providers"
+    : "Active connections on pooled providers";
+
   return (
     <div
       className="stats hidden h-10 overflow-visible border border-base-content/10 bg-base-200 sm:inline-grid"
@@ -87,14 +96,11 @@ export function LiveUsenetConnections({ hasUsenetProviders }: LiveUsenetConnecti
           {showConnecting && <span className="loading loading-spinner loading-xs" />}
         </div>
         <div
-          className="stat-desc tooltip tooltip-bottom text-[10px] leading-none whitespace-nowrap text-base-content/50"
-          data-tip="Warm connections are pre-connected to your Usenet providers so playback can start faster."
+          className="stat-desc text-[10px] leading-none whitespace-nowrap text-base-content/50"
+          title={hasUsenetProviders && connections && !transportDown ? activeTitle : undefined}
         >
           {!hasUsenetProviders && "No providers"}
-          {hasUsenetProviders &&
-            connections &&
-            !transportDown &&
-            `${active} active${idle > 0 ? ` · ${idle} warm` : ""}`}
+          {hasUsenetProviders && connections && !transportDown && activeLabel}
           {showReconnecting && "Reconnecting"}
           {showConnecting && "Connecting"}
         </div>
