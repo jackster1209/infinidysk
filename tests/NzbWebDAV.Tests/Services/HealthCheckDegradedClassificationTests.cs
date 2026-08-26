@@ -16,6 +16,7 @@ using NzbWebDAV.Services;
 using NzbWebDAV.Services.Metrics;
 using NzbWebDAV.Services.Repair;
 using NzbWebDAV.Services.StreamTrace;
+using NzbWebDAV.Tests.Clients.Usenet;
 using NzbWebDAV.Tests.Database;
 using NzbWebDAV.Tests.Fakes;
 using NzbWebDAV.Websocket;
@@ -42,6 +43,8 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
     private RepairPatchStore _patchStore = null!;
     private UsenetStreamingClient _usenet = null!;
     private QueueManager _queueManager = null!;
+    private HealthCheckConnectionGate _healthCheckConnectionGate = null!;
+    private HealthCheckStatScheduler _healthCheckStatScheduler = null!;
 
     public async Task InitializeAsync()
     {
@@ -78,6 +81,11 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         Directory.CreateDirectory(Path.Join(_configRoot, "library"));
 
         _failureTracker = new StreamingFailureTracker();
+        _healthCheckConnectionGate = new HealthCheckConnectionGate(_configManager);
+        _healthCheckStatScheduler = new HealthCheckStatScheduler(
+            _configManager,
+            _healthCheckConnectionGate);
+        await _healthCheckStatScheduler.StartAsync(CancellationToken.None);
         _patchStore = new RepairPatchStore(Path.Join(_configRoot, "patches"), 1024 * 1024);
         await _patchStore.CatalogLoadTask;
 
@@ -90,7 +98,7 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
             new ProviderBytesTracker(),
             new StreamTraceBuffer(100),
             new ActiveReadRegistry());
-        _queueManager = new QueueManager(
+        _queueManager = QueueManager.CreateForTests(
             _usenet,
             _configManager,
             websocketManager,
@@ -98,12 +106,16 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
             new WatchdogLog(),
             new QueueItemSourceTracker(),
             new BenchmarkGate(),
-            startLoop: false);
+            startLoop: false,
+            healthCheckConnectionGate: _healthCheckConnectionGate);
     }
 
     public async Task DisposeAsync()
     {
         _queueManager.Dispose();
+        await _healthCheckStatScheduler.StopAsync(CancellationToken.None);
+        _healthCheckStatScheduler.Dispose();
+        _healthCheckConnectionGate.Dispose();
         _usenet.Dispose();
         await _context.DisposeAsync();
         Environment.SetEnvironmentVariable("CONFIG_PATH", _previousConfigPath);
@@ -125,7 +137,7 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         _failureTracker.RecordAttributedFailure(item.Id, segments[1]);
         var (service, par2) = await NewServiceAsync(NewFakeClient(segments, missing: []), par2Outcome: true);
 
-        await service.PerformHealthCheck(item, _dbClient, concurrency: 4, CancellationToken.None);
+        await service.PerformHealthCheck(item, _dbClient, CancellationToken.None);
 
         Assert.Equal([segments[1]], Assert.Single(par2.Requests));
         Assert.Equal(StreamingFailureSnapshot.Empty, _failureTracker.GetSnapshot(item.Id));
@@ -141,7 +153,7 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         _failureTracker.RecordFailure(item.Id);
         var (service, par2) = await NewServiceAsync(fake, par2Outcome: false);
 
-        await service.PerformHealthCheck(item, _dbClient, concurrency: 4, CancellationToken.None);
+        await service.PerformHealthCheck(item, _dbClient, CancellationToken.None);
 
         // Degraded row, no repair
         var row = Assert.Single(GetHealthRows(item.Id));
@@ -181,7 +193,7 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         var fake = NewFakeClient(segments, missing: [2]);
         var (service, _) = await NewServiceAsync(fake, par2Outcome: false);
 
-        await service.PerformHealthCheck(item, _dbClient, concurrency: 4, CancellationToken.None);
+        await service.PerformHealthCheck(item, _dbClient, CancellationToken.None);
 
         var row = Assert.Single(GetHealthRows(item.Id));
         Assert.Equal(HealthCheckResult.HealthResult.Degraded, row.Result);
@@ -198,7 +210,7 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         var fake = NewFakeClient(segments, missing: [2, 3, 4]);
         var (service, _) = await NewServiceAsync(fake, par2Outcome: false);
 
-        await service.PerformHealthCheck(item, _dbClient, concurrency: 4, CancellationToken.None);
+        await service.PerformHealthCheck(item, _dbClient, CancellationToken.None);
 
         var row = Assert.Single(GetHealthRows(item.Id));
         Assert.Equal(HealthCheckResult.HealthResult.Unhealthy, row.Result);
@@ -219,7 +231,7 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         var fake = NewFakeClient(segments, missing: [0]);
         var (service, _) = await NewServiceAsync(fake, par2Outcome: false);
 
-        await service.PerformHealthCheck(item, _dbClient, concurrency: 4, CancellationToken.None);
+        await service.PerformHealthCheck(item, _dbClient, CancellationToken.None);
 
         var row = Assert.Single(GetHealthRows(item.Id));
         Assert.Equal(HealthCheckResult.HealthResult.Unhealthy, row.Result);
@@ -243,7 +255,7 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         _failureTracker.RecordFailure(item.Id);
         var (service, _) = await NewServiceAsync(fake, par2Outcome: false);
 
-        await service.PerformHealthCheck(item, _dbClient, concurrency: 4, CancellationToken.None);
+        await service.PerformHealthCheck(item, _dbClient, CancellationToken.None);
 
         var row = Assert.Single(GetHealthRows(item.Id));
         Assert.Equal(HealthCheckResult.HealthResult.Healthy, row.Result);
@@ -252,6 +264,76 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         Assert.Equal(oldBlobId, ReloadItem(item.Id).FileBlobId);
         Assert.Equal(0, _failureTracker.GetFailureCount(item.Id)); // healthy path clears
         Assert.True(fake.StatRequestCounts.ContainsKey("alt-seg2@test"));
+    }
+
+    [Fact]
+    public async Task RepeatedFallbackId_ServesEveryPrimaryOccurrence()
+    {
+        var segments = NewSegmentIds(6);
+        var sizes = new long[] { 10_000, 10_000, 50, 50, 10_000, 10_000 };
+        var sharedFallback = $"shared-{Guid.NewGuid():N}@test";
+        var fallbackIds = new string[segments.Length][];
+        for (var i = 0; i < fallbackIds.Length; i++) fallbackIds[i] = [];
+        fallbackIds[2] = [sharedFallback];
+        fallbackIds[3] = [sharedFallback];
+        var (item, oldBlobId) = await AddVideoFileAsync(
+            "movie.mkv", segments, sizes, fallbackIds: fallbackIds);
+        var provider = ScriptedProvider(
+            segments.Where((_, index) => index is not 2 and not 3).Append(sharedFallback).ToArray());
+        var (service, par2) = await NewServiceAsync(ProviderWalk(provider), par2Outcome: false);
+
+        await service.PerformHealthCheck(item, _dbClient, CancellationToken.None);
+
+        var row = Assert.Single(GetHealthRows(item.Id));
+        Assert.Equal(HealthCheckResult.HealthResult.Healthy, row.Result);
+        Assert.Equal(HealthCheckResult.RepairAction.None, row.RepairStatus);
+        Assert.Empty(par2.Requests);
+        Assert.Equal(oldBlobId, ReloadItem(item.Id).FileBlobId);
+    }
+
+    [Fact]
+    public async Task ProviderOutageFollowedByDefinitiveMisses_DefersWithoutRepairing()
+    {
+        var segments = NewSegmentIds(4);
+        var sizes = Enumerable.Repeat(10_000L, segments.Length).ToArray();
+        var (item, oldBlobId) = await AddVideoFileAsync("movie.mkv", segments, sizes);
+        var unavailable = ScriptedProvider(holds: [], throwAfter: 0);
+        var missing = ScriptedProvider(holds: []);
+        var (service, par2) = await NewServiceAsync(
+            ProviderWalk(unavailable, missing),
+            par2Outcome: false);
+
+        await service.PerformHealthCheck(item, _dbClient, CancellationToken.None);
+
+        var row = Assert.Single(GetHealthRows(item.Id));
+        Assert.Equal(HealthCheckResult.HealthResult.Unhealthy, row.Result);
+        Assert.Equal(HealthCheckResult.RepairAction.ActionNeeded, row.RepairStatus);
+        Assert.Contains("Unexpected NNTP response", row.Message);
+        Assert.Empty(par2.Requests);
+        Assert.Equal(oldBlobId, ReloadItem(item.Id).FileBlobId);
+        foreach (var segmentId in segments)
+            HealthCheckService.CheckCachedMissingSegmentIds([segmentId]);
+    }
+
+    [Fact]
+    public async Task ProviderOutageFollowedByExistingArticles_ResolvesHealthy()
+    {
+        var segments = NewSegmentIds(4);
+        var sizes = Enumerable.Repeat(10_000L, segments.Length).ToArray();
+        var (item, oldBlobId) = await AddVideoFileAsync("movie.mkv", segments, sizes);
+        var unavailable = ScriptedProvider(holds: [], throwAfter: 0);
+        var holding = ScriptedProvider(holds: segments);
+        var (service, par2) = await NewServiceAsync(
+            ProviderWalk(unavailable, holding),
+            par2Outcome: false);
+
+        await service.PerformHealthCheck(item, _dbClient, CancellationToken.None);
+
+        var row = Assert.Single(GetHealthRows(item.Id));
+        Assert.Equal(HealthCheckResult.HealthResult.Healthy, row.Result);
+        Assert.Equal(HealthCheckResult.RepairAction.None, row.RepairStatus);
+        Assert.Empty(par2.Requests);
+        Assert.Equal(oldBlobId, ReloadItem(item.Id).FileBlobId);
     }
 
     [Fact]
@@ -265,7 +347,7 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         _failureTracker.RecordFailure(item.Id);
         var (service, par2) = await NewServiceAsync(fake, par2Outcome: true);
 
-        await service.PerformHealthCheck(item, _dbClient, concurrency: 4, CancellationToken.None);
+        await service.PerformHealthCheck(item, _dbClient, CancellationToken.None);
 
         var row = Assert.Single(GetHealthRows(item.Id));
         Assert.Equal(HealthCheckResult.HealthResult.Healthy, row.Result);
@@ -295,7 +377,7 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         var fake = NewFakeClient(segments, missing: [2]);
         var (service, par2) = await NewServiceAsync(fake, par2Outcome: true);
 
-        await service.PerformHealthCheck(item, _dbClient, concurrency: 4, CancellationToken.None);
+        await service.PerformHealthCheck(item, _dbClient, CancellationToken.None);
 
         var row = Assert.Single(GetHealthRows(item.Id));
         Assert.Equal(HealthCheckResult.RepairAction.RepairedViaPar2, row.RepairStatus);
@@ -319,7 +401,7 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         var fake = NewFakeClient(segments, missing: [0]);
         var (service, _) = await NewServiceAsync(fake, par2Outcome: false);
 
-        await service.PerformHealthCheck(item, _dbClient, concurrency: 4, CancellationToken.None);
+        await service.PerformHealthCheck(item, _dbClient, CancellationToken.None);
 
         var row = Assert.Single(GetHealthRows(item.Id));
         Assert.Equal(HealthCheckResult.RepairAction.ActionNeeded, row.RepairStatus);
@@ -338,7 +420,7 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         var fake = NewFakeClient(segments, missing: [50]);
         var (service, par2) = await NewServiceAsync(fake, par2Outcome: false);
 
-        await service.PerformHealthCheck(item, _dbClient, concurrency: 4, CancellationToken.None);
+        await service.PerformHealthCheck(item, _dbClient, CancellationToken.None);
 
         // Legacy path: single-segment PAR2 attempt, then repair; no hole record written.
         var row = Assert.Single(GetHealthRows(item.Id));
@@ -348,6 +430,154 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         Assert.Equal(oldBlobId, ReloadItem(item.Id).FileBlobId);
         Assert.Throws<UsenetArticleNotFoundException>(
             () => HealthCheckService.CheckCachedMissingSegmentIds([segments[50]]));
+    }
+
+    [Fact]
+    public async Task RoutineMissingArticle_WaitsForQueueIdleBeforeStartingRepair()
+    {
+        var segments = NewSegmentIds(HealthCheckService.SampleFloor + 1000);
+        var sizes = Enumerable.Repeat(100L, segments.Length).ToArray();
+        var (item, _) = await AddVideoFileAsync("movie.mkv", segments, sizes);
+        var fake = NewFakeClient(segments, missing: [50]);
+        var (service, par2) = await NewServiceAsync(fake, par2Outcome: false);
+        var queueActive = true;
+        var waitEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        service.CoordinatorPollInterval = TimeSpan.FromMilliseconds(10);
+        service.HasActiveQueueItemsOverride = () =>
+        {
+            waitEntered.TrySetResult();
+            return queueActive;
+        };
+
+        var healthCheck = service.PerformHealthCheck(
+            item,
+            _dbClient,
+            CancellationToken.None);
+        await waitEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.False(healthCheck.IsCompleted);
+        Assert.Empty(par2.Requests);
+
+        queueActive = false;
+        await healthCheck.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.Single(par2.Requests);
+        Assert.Equal(
+            HealthCheckResult.HealthResult.Unhealthy,
+            Assert.Single(GetHealthRows(item.Id)).Result);
+    }
+
+    [Fact]
+    public async Task RoutineMissingArticle_DefersWhenQueueDoesNotBecomeIdle()
+    {
+        var segments = NewSegmentIds(HealthCheckService.SampleFloor + 1000);
+        var sizes = Enumerable.Repeat(100L, segments.Length).ToArray();
+        var (item, _) = await AddVideoFileAsync("movie.mkv", segments, sizes);
+        var fake = NewFakeClient(segments, missing: [50]);
+        var (service, par2) = await NewServiceAsync(fake, par2Outcome: false);
+        service.CoordinatorPollInterval = TimeSpan.FromMilliseconds(5);
+        service.RepairQueueIdleTimeout = TimeSpan.FromMilliseconds(30);
+        service.RepairQueueIdleLogInterval = TimeSpan.FromMilliseconds(10);
+        service.RepairQueueRetryDelay = TimeSpan.FromMinutes(2);
+        service.HasActiveQueueItemsOverride = () => true;
+
+        await service.PerformHealthCheck(
+            item,
+            _dbClient,
+            CancellationToken.None);
+
+        Assert.Empty(par2.Requests);
+        var row = Assert.Single(GetHealthRows(item.Id));
+        Assert.Equal(HealthCheckResult.HealthResult.Unhealthy, row.Result);
+        Assert.Equal(HealthCheckResult.RepairAction.ActionNeeded, row.RepairStatus);
+        Assert.Contains("queue work remained active", row.Message);
+        Assert.True(ReloadItem(item.Id).NextHealthCheck > DateTimeOffset.UtcNow);
+    }
+
+    [Fact]
+    public async Task UrgentRepair_AlreadyAdmitted_DoesNotConsultQueueIdle()
+    {
+        var segments = NewSegmentIds(6);
+        var sizes = Enumerable.Repeat(100L, segments.Length).ToArray();
+        var (item, _) = await AddVideoFileAsync("urgent.mkv", segments, sizes);
+        item.NextHealthCheck = DateTimeOffset.UnixEpoch;
+        await _context.SaveChangesAsync();
+        var fake = NewFakeClient(segments, missing: []);
+        var (service, _) = await NewServiceAsync(fake, par2Outcome: false);
+        service.HasActiveQueueItemsOverride = () =>
+            throw new InvalidOperationException("Urgent repair consulted the routine queue-idle boundary.");
+
+        await service.PerformHealthCheck(
+            item,
+            _dbClient,
+            CancellationToken.None);
+
+        Assert.Empty(fake.StatRequestCounts);
+        var row = Assert.Single(GetHealthRows(item.Id));
+        Assert.Equal(HealthCheckResult.HealthResult.Unhealthy, row.Result);
+        Assert.Equal(HealthCheckResult.RepairAction.ActionNeeded, row.RepairStatus);
+        Assert.DoesNotContain("queue work remained active", row.Message);
+    }
+
+    [Fact]
+    public async Task ConfirmedHoleRepair_DefersWhenQueueDoesNotBecomeIdle()
+    {
+        var segments = NewSegmentIds(6);
+        var sizes = new long[] { 10_000, 10_000, 50, 50, 50, 10_000 };
+        var (item, oldBlobId) = await AddVideoFileAsync("movie.mkv", segments, sizes);
+        var fake = NewFakeClient(segments, missing: [2, 3, 4]);
+        var (service, par2) = await NewServiceAsync(fake, par2Outcome: false);
+        service.CoordinatorPollInterval = TimeSpan.FromMilliseconds(5);
+        service.RepairQueueIdleTimeout = TimeSpan.FromMilliseconds(30);
+        service.RepairQueueIdleLogInterval = TimeSpan.FromMilliseconds(10);
+        service.RepairQueueRetryDelay = TimeSpan.FromMinutes(2);
+        service.HasActiveQueueItemsOverride = () => true;
+
+        await service.PerformHealthCheck(
+            item,
+            _dbClient,
+            CancellationToken.None);
+
+        Assert.Empty(par2.Requests);
+        Assert.Equal(oldBlobId, ReloadItem(item.Id).FileBlobId);
+        var row = Assert.Single(GetHealthRows(item.Id));
+        Assert.Equal(HealthCheckResult.HealthResult.Unhealthy, row.Result);
+        Assert.Equal(HealthCheckResult.RepairAction.ActionNeeded, row.RepairStatus);
+        Assert.Contains("queue work remained active", row.Message);
+    }
+
+    [Fact]
+    public async Task RepairAlreadyStarted_FinishesWhenQueueBecomesActive()
+    {
+        var segments = NewSegmentIds(HealthCheckService.SampleFloor + 1000);
+        var sizes = Enumerable.Repeat(100L, segments.Length).ToArray();
+        var (item, _) = await AddVideoFileAsync("movie.mkv", segments, sizes);
+        var fake = NewFakeClient(segments, missing: [50]);
+        var (service, par2) = await NewServiceAsync(fake, par2Outcome: false);
+        var queueActive = false;
+        var repairStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var finishRepair = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        service.HasActiveQueueItemsOverride = () => queueActive;
+        par2.BeforeResultAsync = async ct =>
+        {
+            repairStarted.TrySetResult();
+            await finishRepair.Task.WaitAsync(ct);
+        };
+
+        var healthCheck = service.PerformHealthCheck(
+            item,
+            _dbClient,
+            CancellationToken.None);
+        await repairStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        queueActive = true;
+        finishRepair.TrySetResult();
+        await healthCheck.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.Single(par2.Requests);
+        var row = Assert.Single(GetHealthRows(item.Id));
+        Assert.Equal(HealthCheckResult.HealthResult.Unhealthy, row.Result);
+        Assert.Equal(HealthCheckResult.RepairAction.ActionNeeded, row.RepairStatus);
+        Assert.DoesNotContain("queue work remained active", row.Message);
     }
 
     [Fact]
@@ -363,7 +593,7 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         var fake = NewFakeClient(segments, missing: [2]);
         var (service, _) = await NewServiceAsync(fake, par2Outcome: false);
 
-        await service.PerformHealthCheck(item, _dbClient, concurrency: 4, CancellationToken.None);
+        await service.PerformHealthCheck(item, _dbClient, CancellationToken.None);
 
         var row = Assert.Single(GetHealthRows(item.Id));
         Assert.Equal(HealthCheckResult.HealthResult.Unhealthy, row.Result);
@@ -383,7 +613,7 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         var fake = NewFakeClient(segments, missing: [2]);
         var (service, _) = await NewServiceAsync(fake, par2Outcome: false);
 
-        await service.PerformHealthCheck(item, _dbClient, concurrency: 4, CancellationToken.None);
+        await service.PerformHealthCheck(item, _dbClient, CancellationToken.None);
 
         var row = Assert.Single(GetHealthRows(item.Id));
         Assert.Equal(HealthCheckResult.HealthResult.Unhealthy, row.Result);
@@ -401,7 +631,7 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         var fake = NewFakeClient(segments, missing: [2]);
         var (service, _) = await NewServiceAsync(fake, par2Outcome: false);
 
-        await service.PerformHealthCheck(item, _dbClient, concurrency: 4, CancellationToken.None);
+        await service.PerformHealthCheck(item, _dbClient, CancellationToken.None);
 
         var row = Assert.Single(GetHealthRows(item.Id));
         Assert.Equal(HealthCheckResult.HealthResult.Unhealthy, row.Result);
@@ -418,7 +648,7 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         fake.Serve(segments[0], Mp4Head(Box("ftyp", 16), Box("mdat", 100)));
         var (service, _) = await NewServiceAsync(fake, par2Outcome: false);
 
-        await service.PerformHealthCheck(item, _dbClient, concurrency: 4, CancellationToken.None);
+        await service.PerformHealthCheck(item, _dbClient, CancellationToken.None);
 
         var row = Assert.Single(GetHealthRows(item.Id));
         Assert.Equal(HealthCheckResult.HealthResult.Unhealthy, row.Result);
@@ -444,7 +674,7 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         fake.Serve(segments[0], Mp4Head(Box("ftyp", 16), Box("moov", 24), Box("mdat", 100)));
         var (service, _) = await NewServiceAsync(fake, par2Outcome: false);
 
-        await service.PerformHealthCheck(item, _dbClient, concurrency: 4, CancellationToken.None);
+        await service.PerformHealthCheck(item, _dbClient, CancellationToken.None);
 
         var row = Assert.Single(GetHealthRows(item.Id));
         Assert.Equal(HealthCheckResult.HealthResult.Degraded, row.Result);
@@ -459,7 +689,7 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
 
         // Second check with identical holes: persisted class is reused (no second BODY)
         // and the unchanged record is not rewritten.
-        await service.PerformHealthCheck(item, _dbClient, concurrency: 4, CancellationToken.None);
+        await service.PerformHealthCheck(item, _dbClient, CancellationToken.None);
 
         Assert.Equal(2, GetHealthRows(item.Id).Count);
         Assert.Equal(1, fake.BodyRequestCounts.GetValueOrDefault(segments[0]));
@@ -480,7 +710,7 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         fake.Serve(segments[0], Mp4Head(Box("ftyp", 16), BoxHeader("moov", 15_000)));
         var (service, _) = await NewServiceAsync(fake, par2Outcome: false);
 
-        await service.PerformHealthCheck(item, _dbClient, concurrency: 4, CancellationToken.None);
+        await service.PerformHealthCheck(item, _dbClient, CancellationToken.None);
 
         var row = Assert.Single(GetHealthRows(item.Id));
         Assert.Equal(HealthCheckResult.HealthResult.Unhealthy, row.Result);
@@ -495,7 +725,7 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         Assert.Throws<UsenetArticleNotFoundException>(
             () => HealthCheckService.CheckCachedMissingSegmentIds([segments[1]]));
 
-        await service.PerformHealthCheck(item, _dbClient, concurrency: 4, CancellationToken.None);
+        await service.PerformHealthCheck(item, _dbClient, CancellationToken.None);
 
         Assert.Equal(2, GetHealthRows(item.Id).Count);
         Assert.All(
@@ -514,13 +744,13 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         fake.Serve(segments[0], Mp4Head(Box("ftyp", 16), Box("moov", 24), Box("mdat", 100)));
         var (service, _) = await NewServiceAsync(fake, par2Outcome: false);
 
-        await service.PerformHealthCheck(item, _dbClient, concurrency: 4, CancellationToken.None);
+        await service.PerformHealthCheck(item, _dbClient, CancellationToken.None);
         var afterFirst = ReloadItem(item.Id);
         Assert.Equal(HealthCheckResult.HealthResult.Degraded, Assert.Single(GetHealthRows(item.Id)).Result);
 
         // Provider-side restoration: the segment is back on the next sweep.
         fake.Serve(segments[4], new byte[50]);
-        await service.PerformHealthCheck(item, _dbClient, concurrency: 4, CancellationToken.None);
+        await service.PerformHealthCheck(item, _dbClient, CancellationToken.None);
 
         var rows = GetHealthRows(item.Id);
         Assert.Equal(2, rows.Count);
@@ -546,7 +776,7 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         var fake = NewFakeClient(segments, missing: [2]);
         var (service, _) = await NewServiceAsync(fake, par2Outcome: false);
 
-        await service.PerformHealthCheck(item, _dbClient, concurrency: 4, CancellationToken.None);
+        await service.PerformHealthCheck(item, _dbClient, CancellationToken.None);
 
         // The patched segment is never STATed, yet the check still classifies
         // (full coverage is measured on the sampled list, not the STAT list).
@@ -568,7 +798,7 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         var fake = NewFakeClient(segments, missing: [], corrupt: [2]);
         var (service, par2) = await NewServiceAsync(fake, par2Outcome: false);
 
-        await service.PerformHealthCheck(item, _dbClient, concurrency: 4, CancellationToken.None);
+        await service.PerformHealthCheck(item, _dbClient, CancellationToken.None);
 
         var row = Assert.Single(GetHealthRows(item.Id));
         Assert.Equal(HealthCheckResult.HealthResult.Degraded, row.Result);
@@ -590,7 +820,7 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         var fake = NewFakeClient(segments, missing: [], corrupt: corrupt);
         var (service, _) = await NewServiceAsync(fake, par2Outcome: false);
 
-        await service.PerformHealthCheck(item, _dbClient, concurrency: 4, CancellationToken.None);
+        await service.PerformHealthCheck(item, _dbClient, CancellationToken.None);
 
         var row = Assert.Single(GetHealthRows(item.Id));
         Assert.Equal(HealthCheckResult.HealthResult.Unhealthy, row.Result);
@@ -607,7 +837,7 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         var fake = NewFakeClient(segments, missing: [], corrupt: [0]);
         var (service, _) = await NewServiceAsync(fake, par2Outcome: false);
 
-        await service.PerformHealthCheck(item, _dbClient, concurrency: 4, CancellationToken.None);
+        await service.PerformHealthCheck(item, _dbClient, CancellationToken.None);
 
         var row = Assert.Single(GetHealthRows(item.Id));
         Assert.Equal(HealthCheckResult.HealthResult.Unhealthy, row.Result);
@@ -623,7 +853,7 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         var fake = NewFakeClient(segments, missing: [2], corrupt: [4]);
         var (service, par2) = await NewServiceAsync(fake, par2Outcome: false);
 
-        await service.PerformHealthCheck(item, _dbClient, concurrency: 4, CancellationToken.None);
+        await service.PerformHealthCheck(item, _dbClient, CancellationToken.None);
 
         var row = Assert.Single(GetHealthRows(item.Id));
         Assert.Equal(HealthCheckResult.HealthResult.Degraded, row.Result);
@@ -644,7 +874,7 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         var fake = NewFakeClient(segments, missing: []);
         var (service, par2) = await NewServiceAsync(fake, par2Outcome: false);
 
-        await service.PerformHealthCheck(item, _dbClient, concurrency: 4, CancellationToken.None);
+        await service.PerformHealthCheck(item, _dbClient, CancellationToken.None);
 
         var row = Assert.Single(GetHealthRows(item.Id));
         Assert.Equal(HealthCheckResult.HealthResult.Healthy, row.Result);
@@ -664,7 +894,7 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         var fake = NewFakeClient(segments, missing: []);
         var (service, par2) = await NewServiceAsync(fake, par2Outcome: false);
 
-        await service.PerformHealthCheck(item, _dbClient, concurrency: 4, CancellationToken.None);
+        await service.PerformHealthCheck(item, _dbClient, CancellationToken.None);
 
         var row = Assert.Single(GetHealthRows(item.Id));
         Assert.Equal(HealthCheckResult.HealthResult.Healthy, row.Result);
@@ -685,7 +915,7 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         fake.ForcedResponseSegmentId = "wrong@example.com";
         var (service, par2) = await NewServiceAsync(fake, par2Outcome: false);
 
-        await service.PerformHealthCheck(item, _dbClient, concurrency: 4, CancellationToken.None);
+        await service.PerformHealthCheck(item, _dbClient, CancellationToken.None);
 
         var row = Assert.Single(GetHealthRows(item.Id));
         Assert.Equal(HealthCheckResult.HealthResult.Degraded, row.Result);
@@ -704,7 +934,7 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         var fake = NewFakeClient(segments, missing: []);
         var (service, _) = await NewServiceAsync(fake, par2Outcome: false);
 
-        await service.PerformHealthCheck(item, _dbClient, concurrency: 4, CancellationToken.None);
+        await service.PerformHealthCheck(item, _dbClient, CancellationToken.None);
 
         var row = Assert.Single(GetHealthRows(item.Id));
         Assert.Equal(HealthCheckResult.HealthResult.Healthy, row.Result);
@@ -725,7 +955,7 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         BlobStore.Use(new OutOfMemoryBlobStore());
         try
         {
-            await service.PerformHealthCheck(item, _dbClient, concurrency: 4, CancellationToken.None);
+            await service.PerformHealthCheck(item, _dbClient, CancellationToken.None);
         }
         finally
         {
@@ -796,8 +1026,28 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         public void Delete(Guid id) => throw new NotSupportedException();
     }
 
+    private static MultiProviderNntpClientTests.ScriptedNntpClient ScriptedProvider(
+        IReadOnlyCollection<string> holds,
+        int? throwAfter = null) => new()
+        {
+            BatchResponseCode = 430,
+            SingularResponseCode = (int)UsenetResponseType.NoArticleWithThatMessageId,
+            PipelinedStatHolds = holds.ToHashSet(StringComparer.Ordinal),
+            PipelinedStatThrowAfter = throwAfter,
+        };
+
+    private static MultiProviderNntpClient ProviderWalk(
+        params MultiProviderNntpClientTests.ScriptedNntpClient[] providers) => new(
+        providers
+            .Select((provider, index) => MultiProviderNntpClientTests.CreateProvider(
+                provider,
+                host: $"provider-{index}.example",
+                maxConnections: 4,
+                priority: index))
+            .ToList());
+
     private async Task<(HealthCheckService Service, ScriptedPar2RepairService Par2)> NewServiceAsync(
-        FakeNntpClient fake,
+        INntpClient fake,
         bool par2Outcome)
     {
         await _usenet.ReplaceUnderlyingClientForTestsAsync(fake);
@@ -811,7 +1061,9 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
             _queueManager,
             par2,
             _patchStore,
-            new ArrReplacementSearchBudget());
+            new ArrReplacementSearchBudget(),
+            _healthCheckConnectionGate,
+            _healthCheckStatScheduler);
         return (service, par2);
     }
 
@@ -915,12 +1167,15 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         bool repairOutcome) : Par2RepairService(configManager, null!, store)
     {
         public List<string[]> Requests { get; } = [];
+        public Func<CancellationToken, Task>? BeforeResultAsync { get; set; }
 
-        public override Task<bool> TryPar2RepairAsync(
+        public override async Task<bool> TryPar2RepairAsync(
             DavItem davItem, IReadOnlyList<string>? missingSegmentIds, CancellationToken ct)
         {
             Requests.Add(missingSegmentIds?.ToArray() ?? []);
-            return Task.FromResult(repairOutcome);
+            if (BeforeResultAsync is { } beforeResult)
+                await beforeResult(ct);
+            return repairOutcome;
         }
     }
 }

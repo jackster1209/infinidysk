@@ -79,6 +79,7 @@ public sealed class HealthCheckWorkerAdmissionTests
             var patchStore = new RepairPatchStore(patchDirectory, 1024 * 1024);
             await patchStore.CatalogLoadTask;
             var time = new ControllableTimeProvider();
+            var gate = new HealthCheckConnectionGate(config);
             var service = new HealthCheckService(
                 config,
                 null!,
@@ -89,6 +90,8 @@ public sealed class HealthCheckWorkerAdmissionTests
                 new Par2RepairService(config, null!, patchStore),
                 patchStore,
                 new ArrReplacementSearchBudget(),
+                gate,
+                new HealthCheckStatScheduler(config, gate),
                 timeProvider: time);
             return new HealthFixture(service, time, patchDirectory);
         }
