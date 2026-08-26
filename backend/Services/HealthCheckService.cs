@@ -1002,7 +1002,7 @@ public class HealthCheckService : BackgroundService
         var percentageProgress = progress is null
             ? null
             : new SynchronousProgress<int>(terminal =>
-                progress.Report((int)((long)terminal * 100 / total)));
+                progress.Report(LogicalSweepProgress.ToInFlightPercentage(terminal, total)));
         var sweepProgress = new LogicalSweepProgress(percentageProgress, total, () =>
         {
             try { statCts.CancelAfter(HealthCheckProgressTimeout); }

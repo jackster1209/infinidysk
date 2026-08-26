@@ -11,7 +11,6 @@ internal sealed class LogicalSweepProgress(
     Action? onActivity = null)
 {
     private readonly Lock _lock = new();
-    private readonly int _inFlightCeiling = Math.Max(total - 1, 0);
     private int _terminal;
     private int _accepted = -1;
     private int _reported = -1;
@@ -24,8 +23,8 @@ internal sealed class LogicalSweepProgress(
     public void Start() => Publish(0);
 
     /// <summary>
-    /// Counts newly terminal source positions. Until the health check itself finishes, the
-    /// final position is held back so only the outer completion event can display 100%.
+    /// Counts newly terminal source positions. Percentage presentation reserves 100% for the
+    /// outer completion event without distorting this logical count for small sweeps.
     /// </summary>
     public void AdvanceTerminal(int count)
     {
@@ -34,9 +33,16 @@ internal sealed class LogicalSweepProgress(
         lock (_lock)
         {
             _terminal = Math.Min(total, _terminal + count);
-            value = Math.Min(_terminal, _inFlightCeiling);
+            value = _terminal;
         }
         Publish(value);
+    }
+
+    internal static int ToInFlightPercentage(int terminal, int total)
+    {
+        if (total <= 0) return 0;
+        var clamped = Math.Clamp(terminal, 0, total);
+        return Math.Min((int)((long)clamped * 100 / total), 99);
     }
 
     /// <summary>

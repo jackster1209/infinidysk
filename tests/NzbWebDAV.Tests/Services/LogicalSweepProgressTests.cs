@@ -29,7 +29,7 @@ public sealed class LogicalSweepProgressTests
     }
 
     [Fact]
-    public void AllTerminal_HoldsBackOnlyTheFinalUnit()
+    public void AllTerminal_ReportsEveryResolvedLogicalUnit()
     {
         var reports = new List<int>();
         var sweep = new LogicalSweepProgress(new Recorder(reports), total: 4_060);
@@ -37,12 +37,11 @@ public sealed class LogicalSweepProgressTests
 
         sweep.AdvanceTerminal(4_060);
 
-        Assert.Equal(4_059, reports[^1]);
-        Assert.Equal(99, reports[^1] * 100 / 4_060);
+        Assert.Equal(4_060, reports[^1]);
     }
 
     [Fact]
-    public void SingleSegmentSweep_RemainsAtZeroUntilOuterCompletion()
+    public void SingleSegmentSweep_ReportsItsTerminalUnit()
     {
         var reports = new List<int>();
         var sweep = new LogicalSweepProgress(new Recorder(reports), total: 1);
@@ -50,7 +49,22 @@ public sealed class LogicalSweepProgressTests
 
         sweep.AdvanceTerminal(1);
 
-        Assert.Equal([0], reports);
+        Assert.Equal([0, 1], reports);
+    }
+
+    [Theory]
+    [InlineData(0, 1, 0)]
+    [InlineData(1, 1, 99)]
+    [InlineData(1, 2, 50)]
+    [InlineData(2, 2, 99)]
+    [InlineData(3_900, 4_060, 96)]
+    [InlineData(4_060, 4_060, 99)]
+    public void InFlightPercentage_ReservesOnlyDisplayedOneHundredPercent(
+        int terminal,
+        int total,
+        int expected)
+    {
+        Assert.Equal(expected, LogicalSweepProgress.ToInFlightPercentage(terminal, total));
     }
 
     [Fact]
