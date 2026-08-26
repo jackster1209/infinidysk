@@ -1029,10 +1029,7 @@ public sealed class HealthCheckStatScheduler : BackgroundService
         public SessionState Session { get; } = session;
         public int Offset { get; } = offset;
         public int Length { get; } = length;
-        public string[] SegmentIds { get; } = session.SegmentIds
-            .Skip(offset)
-            .Take(length)
-            .ToArray();
+        public string[] SegmentIds { get; } = CopySegmentIds(session.SegmentIds, offset, length);
         public HealthCheckProviderLease? ProviderLease { get; } = providerLease;
         public HealthCheckConnectionGate.Lease GlobalLease { get; } = globalLease;
         public Task? Execution { get; set; }
@@ -1052,6 +1049,13 @@ public sealed class HealthCheckStatScheduler : BackgroundService
             {
                 ProviderLease?.Dispose();
             }
+        }
+
+        private static string[] CopySegmentIds(List<string> source, int offset, int length)
+        {
+            var destination = new string[length];
+            source.CopyTo(offset, destination, 0, length);
+            return destination;
         }
     }
 

@@ -56,8 +56,14 @@ export function HealthTable({ isEnabled, healthCheckItems, verificationLoad }: H
               </thead>
               <tbody>
                 {healthCheckItems.map((item) => {
-                  const statSessions = verificationLoad.scheduler.sessions.filter(
+                  const itemSessions = verificationLoad.scheduler.sessions.filter(
                     (session) => session.davItemId === item.id,
+                  );
+                  // Health sweeps are serialized per item. Keep aggregation scoped to one run
+                  // so a future overlap cannot silently combine unrelated diagnostics.
+                  const activeRunId = itemSessions[0]?.runId;
+                  const statSessions = itemSessions.filter(
+                    (session) => session.runId === activeRunId,
                   );
                   const statActivity =
                     statSessions.length > 0
@@ -65,10 +71,9 @@ export function HealthTable({ isEnabled, healthCheckItems, verificationLoad }: H
                           (summary, session) => ({
                             inFlight: summary.inFlight + session.inFlight,
                             completed: summary.completed + session.completed,
-                            total: summary.total + session.total,
                             acceptingInput: summary.acceptingInput || !session.inputCompleted,
                           }),
-                          { inFlight: 0, completed: 0, total: 0, acceptingInput: false },
+                          { inFlight: 0, completed: 0, acceptingInput: false },
                         )
                       : null;
                   return (
@@ -83,9 +88,9 @@ export function HealthTable({ isEnabled, healthCheckItems, verificationLoad }: H
                           </div>
                           {statActivity && (
                             <div className="font-mono text-[11px] tabular-nums text-info/75">
-                              {statActivity.inFlight} active STAT ·{" "}
-                              {statActivity.completed.toLocaleString()} /{" "}
-                              {statActivity.total.toLocaleString()} provider checks
+                              {statActivity.completed.toLocaleString()} completed provider checks
+                              {" · "}
+                              {statActivity.inFlight} active STAT
                               {statActivity.acceptingInput ? " · streaming fallback" : ""}
                             </div>
                           )}

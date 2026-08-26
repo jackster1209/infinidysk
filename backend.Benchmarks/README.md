@@ -30,7 +30,7 @@ structured `Health verification pipeline` and `Health verification provider stag
 
 - total, primary, and fallback elapsed milliseconds;
 - logical input versus source positions (duplicate IDs are collapsed);
-- per-provider queue input, batches/items, and cumulative execution milliseconds;
+- per-provider queue input, batches/items, and aggregate connection milliseconds;
 - exists, definitive-missing, unanswered, and forwarded counts; and
 - the Health page's aggregate active provider checks during the fallback tail.
 

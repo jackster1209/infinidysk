@@ -1121,24 +1121,24 @@ public class HealthCheckService : BackgroundService
                     completion =>
                     {
                         everUnanswered.UnionWith(completion.UnansweredIds);
-                        var unresolvedIds = completion.MissingIds
-                            .Concat(completion.UnansweredIds)
-                            .ToHashSet(StringComparer.Ordinal);
-                        var unresolved = completion.SegmentIds
-                            .Where(unresolvedIds.Contains)
-                            .ToArray();
+                        var unresolvedIds = completion.MissingIds.ToHashSet(StringComparer.Ordinal);
+                        unresolvedIds.UnionWith(completion.UnansweredIds);
+                        var unresolved = new List<string>(unresolvedIds.Count);
+                        foreach (var segmentId in completion.SegmentIds)
+                            if (unresolvedIds.Contains(segmentId))
+                                unresolved.Add(segmentId);
                         diagnostics.RecordResults(
-                            completion.SegmentIds.Count - unresolved.Length,
+                            completion.SegmentIds.Count - unresolved.Count,
                             completion.MissingIds.Count,
                             completion.UnansweredIds.Count,
-                            downstream is null ? 0 : unresolved.Length);
+                            downstream is null ? 0 : unresolved.Count);
                         sweepProgress.AdvanceTerminal(
                             downstream is null
                                 ? completion.SegmentIds.Count
-                                : completion.SegmentIds.Count - unresolved.Length);
+                                : completion.SegmentIds.Count - unresolved.Count);
                         if (downstream is not null)
                         {
-                            stageDiagnostics[phaseIndex + 1].AddQueueInput(unresolved.Length);
+                            stageDiagnostics[phaseIndex + 1].AddQueueInput(unresolved.Count);
                             downstream.Add(unresolved);
                         }
                         else
@@ -1297,7 +1297,7 @@ public class HealthCheckService : BackgroundService
             Log.Debug(
                 "Health verification provider stage for {DavItemId}. ProviderKey={ProviderKey} " +
                 "QueueInput={QueueInput} BatchesStarted={BatchesStarted} " +
-                "BatchItems={BatchItems} ExecutionElapsedMs={ExecutionElapsedMs:F1} " +
+                "BatchItems={BatchItems} ExecutionConnectionMs={ExecutionConnectionMs:F1} " +
                 "Exists={Exists} DefinitiveMissing={DefinitiveMissing} " +
                 "Unanswered={Unanswered} Forwarded={Forwarded}",
                 davItemId,
@@ -1305,7 +1305,7 @@ public class HealthCheckService : BackgroundService
                 stage.QueueInput,
                 stage.BatchesStarted,
                 stage.BatchItems,
-                stage.ExecutionElapsedMilliseconds,
+                stage.ExecutionConnectionMilliseconds,
                 stage.Exists,
                 stage.DefinitiveMissing,
                 stage.Unanswered,
@@ -1328,7 +1328,7 @@ public class HealthCheckService : BackgroundService
         public long QueueInput => Volatile.Read(ref _queueInput);
         public long BatchesStarted => Volatile.Read(ref _batchesStarted);
         public long BatchItems => Volatile.Read(ref _batchItems);
-        public double ExecutionElapsedMilliseconds =>
+        public double ExecutionConnectionMilliseconds =>
             Volatile.Read(ref _executionTimestampTicks) * 1000d / Stopwatch.Frequency;
         public long Exists => Volatile.Read(ref _exists);
         public long DefinitiveMissing => Volatile.Read(ref _definitiveMissing);
