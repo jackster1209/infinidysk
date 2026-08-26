@@ -478,8 +478,8 @@ public sealed class HealthCheckStatScheduler : BackgroundService
                         finished.MissingOffsets is { Count: > 0 } missingOffsets
                             ? missingOffsets.Select(offset => assignment.SegmentIds[offset]).ToArray()
                             : [],
-                        finished.UnansweredOffsets is { Count: > 0 } unansweredOffsets
-                            ? unansweredOffsets.Select(offset => assignment.SegmentIds[offset]).ToArray()
+                        finished.UnansweredOffsets is { Count: > 0 } unansweredOffsetsInChunk
+                            ? unansweredOffsetsInChunk.Select(offset => assignment.SegmentIds[offset]).ToArray()
                             : []));
                 }
                 catch (Exception exception) when (exception is not OutOfMemoryException)
@@ -1024,7 +1024,7 @@ public sealed class HealthCheckStatScheduler : BackgroundService
         public SessionState Session { get; } = session;
         public int Offset { get; } = offset;
         public int Length { get; } = length;
-        public IReadOnlyList<string> SegmentIds { get; } = session.SegmentIds
+        public string[] SegmentIds { get; } = session.SegmentIds
             .Skip(offset)
             .Take(length)
             .ToArray();

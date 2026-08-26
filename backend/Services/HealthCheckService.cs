@@ -1234,7 +1234,7 @@ public class HealthCheckService : BackgroundService
         Guid davItemId,
         int phaseId,
         string? providerKey,
-        IReadOnlyList<string> segmentIds,
+        string[] segmentIds,
         HealthCheckStatDetailedChunkExecutor executor,
         IProgress<int>? progress,
         ContextualCancellationTokenSource statCts)
