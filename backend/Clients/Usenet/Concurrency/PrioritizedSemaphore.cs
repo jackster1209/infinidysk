@@ -81,6 +81,24 @@ public sealed class PrioritizedSemaphore : IDisposable
         }
     }
 
+    /// <summary>
+    /// Enters without queuing, or returns false. Fairness is preserved: a permit that
+    /// exists while any waiter is parked belongs to that waiter, so a walk-up caller
+    /// never overtakes the high- or low-priority queues.
+    /// </summary>
+    public bool TryWait()
+    {
+        lock (_lock)
+        {
+            if (_disposed) return false;
+            if (_enteredCount >= _maxAllowed) return false;
+            if (_highPriorityWaiters.Count > 0 || _lowPriorityWaiters.Count > 0) return false;
+
+            _enteredCount++;
+            return true;
+        }
+    }
+
     public void Release()
     {
         TaskCompletionSource<bool>? toRelease;

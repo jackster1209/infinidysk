@@ -9,6 +9,7 @@ using NzbWebDAV.Clients.Usenet.Models;
 using NzbWebDAV.Exceptions;
 using NzbWebDAV.Extensions;
 using NzbWebDAV.Models;
+using NzbWebDAV.Services;
 using NzbWebDAV.Services.Metrics;
 using NzbWebDAV.Services.StreamTrace;
 using Serilog;
@@ -44,9 +45,21 @@ public class MultiConnectionNntpClient(
     int? pipeliningDepth = null,
     string storageGroup = "",
     string? metricsKey = null,
-    ProviderLatencyTracker? latencyTracker = null
+    ProviderLatencyTracker? latencyTracker = null,
+    int? maxTransferConnections = null,
+    SemaphorePriorityOdds? priorityOdds = null,
+    Action<ProviderConnectionAdmissionSnapshot>? onConnectionAdmissionChanged = null
 ) : NntpClient
 {
+    private readonly ProviderConnectionAdmission? _connectionAdmission =
+        maxTransferConnections is { } transferLimit
+            ? new ProviderConnectionAdmission(
+                () => connectionPool.EffectiveMaxConnections,
+                transferLimit,
+                priorityOdds,
+                onConnectionAdmissionChanged)
+            : null;
+
     public ProviderType ProviderType { get; } = type;
     public int Priority { get; } = priority;
     public string Host { get; } = providerName;
@@ -87,6 +100,18 @@ public class MultiConnectionNntpClient(
     }
 
     public int? ConfiguredPipeliningDepth { get; } = pipeliningDepth;
+
+    /// <summary>
+    /// The pipeline depth health STAT sweeps actually run at on this provider's physical
+    /// connections.
+    /// <para>
+    /// This is NOT <see cref="ConfiguredPipeliningDepth"/>. That setting is BODY/queue
+    /// oriented; <c>StatsPipelinedAsync</c> discards its <c>depth</c> argument and lets
+    /// UsenetSharp window STAT at the <c>MaxPipelineDepth</c> the connection was built
+    /// with. A provider configured for depth 16 therefore still sweeps at this value.
+    /// </para>
+    /// </summary>
+    public int EffectiveStatPipelineDepth => BaseNntpClient.EffectiveStatPipelineDepth;
     // null or non-positive = uncapped. Routing reads these to decide whether
     // this provider should be skipped when it has exhausted its block.
     public long? ByteLimit { get; } = byteLimit;
@@ -104,6 +129,56 @@ public class MultiConnectionNntpClient(
     public int IdleConnections => connectionPool.IdleConnections;
     public int ActiveConnections => connectionPool.ActiveConnections;
     public int AvailableConnections => connectionPool.AvailableConnections;
+    public ProviderConnectionAdmissionSnapshot? GetConnectionAdmissionSnapshot() =>
+        _connectionAdmission?.GetSnapshot();
+    internal bool HasConnectionAdmission => _connectionAdmission is not null;
+    internal Guid? ConnectionAdmissionId => _connectionAdmission?.InstanceId;
+    internal event Action<ProviderConnectionAdmissionSnapshot>? HealthAdmissionAvailabilityChanged
+    {
+        add
+        {
+            if (_connectionAdmission is not null)
+                _connectionAdmission.AvailabilityChanged += value;
+        }
+        remove
+        {
+            if (_connectionAdmission is not null)
+                _connectionAdmission.AvailabilityChanged -= value;
+        }
+    }
+
+    /// <summary>
+    /// Takes one real physical pool permit without queuing, for providers that keep the
+    /// historical shared-pool model and expose no transfer/metadata split. Existing pool
+    /// waiters are never bypassed.
+    /// </summary>
+    internal bool TryReserveHealthConnection(
+        out ConnectionPool<INntpClient>.Reservation? reservation) =>
+        connectionPool.TryReserve(out reservation);
+
+    internal event EventHandler<ConnectionPoolStats.ConnectionPoolChangedEventArgs>? HealthPoolChanged
+    {
+        add => connectionPool.OnConnectionPoolChanged += value;
+        remove => connectionPool.OnConnectionPoolChanged -= value;
+    }
+
+    internal bool TryAcquireHealthMetadata(
+        SemaphorePriority priority,
+        out ProviderConnectionAdmission.Lease? lease)
+    {
+        // Legacy shared-pool providers expose no split admission; report "not acquired"
+        // so the caller keeps its bounded compatibility path instead of inventing a budget.
+        if (_connectionAdmission is null)
+        {
+            lease = null;
+            return false;
+        }
+
+        return _connectionAdmission.TryAcquire(
+            ProviderConnectionKind.Metadata,
+            priority,
+            out lease);
+    }
     public int InFlightConnections => ActiveConnections + PendingSelections;
     public ConnectionPoolChurn GetConnectionChurn() => connectionPool.GetChurn();
 
@@ -111,7 +186,11 @@ public class MultiConnectionNntpClient(
     /// Applies new Streaming Priority odds to this provider's connection gate without
     /// rebuilding the pool.
     /// </summary>
-    public void UpdatePriorityOdds(SemaphorePriorityOdds odds) => connectionPool.UpdatePriorityOdds(odds);
+    public void UpdatePriorityOdds(SemaphorePriorityOdds odds)
+    {
+        connectionPool.UpdatePriorityOdds(odds);
+        _connectionAdmission?.UpdatePriorityOdds(odds);
+    }
 
     private int _pendingSelections;
     private int _retiredPoolWarningLogged;
@@ -820,7 +899,13 @@ public class MultiConnectionNntpClient(
 
     private static SemaphorePriority GetDownloadPriority(CancellationToken ct)
     {
-        return ct.GetContext<DownloadPriorityContext>()?.Priority ?? SemaphorePriority.Low;
+        if (ct.GetContext<DownloadPriorityContext>() is { } downloadPriority)
+            return downloadPriority.Priority;
+
+        return ct.GetContext<HealthCheckAdmissionContext>()?.Priority
+            == HealthCheckAdmissionPriority.Queue
+                ? SemaphorePriority.High
+                : SemaphorePriority.Low;
     }
 
     /// <summary>
@@ -837,20 +922,96 @@ public class MultiConnectionNntpClient(
         var traceRange = MultiProviderNntpClient.CurrentStreamTraceRange;
         var started = Stopwatch.GetTimestamp();
         ConnectionLock<INntpClient> connectionLock;
+        ProviderConnectionAdmission.Lease? admissionLease = null;
+        HealthCheckConnectionGate.Lease? healthCheckLease = null;
         try
         {
-            connectionLock = await connectionPool.GetConnectionLockAsync(priority, ct)
+            var healthCheckContext = ct.GetContext<HealthCheckAdmissionContext>();
+            var schedulerProviderLease =
+                (healthCheckContext as ProviderAwareHealthCheckAdmissionContext)?.ProviderLease;
+            var providerClaim = schedulerProviderLease?.PreAcquiredClaim;
+            var providerAdmissionPreAcquired = _connectionAdmission is not null
+                && providerClaim is { } claim
+                && ClassifyConnectionKind(operation) == ProviderConnectionKind.Metadata
+                && string.Equals(claim.ProviderKey, MetricsKey, StringComparison.Ordinal)
+                && claim.AdmissionId == _connectionAdmission.InstanceId;
+            if (_connectionAdmission is not null && !providerAdmissionPreAcquired)
+            {
+                admissionLease = await _connectionAdmission.AcquireAsync(
+                        ClassifyConnectionKind(operation), priority, ct)
+                    .ConfigureAwait(false);
+            }
+
+            // Provider-local saturation must not consume an aggregate health slot and
+            // block ready work on another provider. Scheduler-owned pre-acquired leases
+            // remain unchanged; other health callers acquire the shared gate only after
+            // this provider has admitted the operation.
+            if (healthCheckContext is { GateLeasePreAcquired: false })
+            {
+                healthCheckLease = await healthCheckContext.Gate
+                    .AcquireAsync(healthCheckContext.Priority, ct)
+                    .ConfigureAwait(false);
+            }
+
+            // A legacy scheduler lease already holds one real permit on this exact pool.
+            // Consume it here so the assignment does not queue on the pool gate a second
+            // time; anything else (including a second connection in the same sweep) waits
+            // normally.
+            var poolReservation = schedulerProviderLease is not null
+                && ClassifyConnectionKind(operation) == ProviderConnectionKind.Metadata
+                && string.Equals(
+                    schedulerProviderLease.ProviderKey, MetricsKey, StringComparison.Ordinal)
+                    ? schedulerProviderLease.TryTakePoolReservation(connectionPool)
+                    : null;
+
+            connectionLock = await connectionPool
+                .GetConnectionLockAsync(priority, poolReservation, ct)
                 .ConfigureAwait(false);
+            if (admissionLease is not null || healthCheckLease is not null)
+            {
+                var attachedAdmissionLease = admissionLease;
+                var attachedHealthCheckLease = healthCheckLease;
+                try
+                {
+                    connectionLock.AttachDisposeCallback(() =>
+                    {
+                        try { attachedAdmissionLease?.Dispose(); }
+                        finally { attachedHealthCheckLease?.Dispose(); }
+                    });
+                }
+                catch
+                {
+                    connectionLock.Dispose();
+                    throw;
+                }
+                admissionLease = null;
+                healthCheckLease = null;
+            }
         }
         catch (Exception e) when (IsRetiredPoolAcquisitionFailure(e) && e is not OutOfMemoryException)
         {
             throw CreateRetiredPoolException(e);
+        }
+        finally
+        {
+            admissionLease?.Dispose();
+            healthCheckLease?.Dispose();
         }
         var elapsed = Stopwatch.GetElapsedTime(started);
         latencyTracker?.Record(MetricsKey, LatencyPhase.PoolWait, workload, operation, elapsed);
         StreamTrace.TryConnectionAcquired(traceRange, elapsed, connectionLock.WasReused);
         return connectionLock;
     }
+
+    // Admission is a pool-wait latency marker, not a real NNTP command — it falls
+    // through to Metadata intentionally so it never consumes a transfer slot.
+    internal static ProviderConnectionKind ClassifyConnectionKind(NntpOperation operation) =>
+        operation is NntpOperation.Body
+            or NntpOperation.Article
+            or NntpOperation.PipelinedBody
+            or NntpOperation.PipelinedArticle
+            ? ProviderConnectionKind.Transfer
+            : ProviderConnectionKind.Metadata;
 
     /// <summary>
     /// Acquisition wrapper for the pipelined enumerable paths, which have no retry loop
@@ -925,7 +1086,8 @@ public class MultiConnectionNntpClient(
     /// Stale requests must abandon without retrying the same dead pool or feeding the breaker.
     /// </summary>
     private bool IsRetiredPoolAcquisitionFailure(Exception e) =>
-        connectionPool.IsDisposed && e is ObjectDisposedException or OperationCanceledException;
+        (connectionPool.IsDisposed || _connectionAdmission?.IsDisposed == true)
+        && e is ObjectDisposedException or OperationCanceledException;
 
     private NntpClientRetiredException CreateRetiredPoolException(Exception inner)
     {
@@ -974,6 +1136,7 @@ public class MultiConnectionNntpClient(
 
     public override void Dispose()
     {
+        _connectionAdmission?.Dispose();
         connectionPool.Dispose();
         GC.SuppressFinalize(this);
     }

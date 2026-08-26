@@ -87,7 +87,13 @@ public sealed record UsenetClientOptions
     /// to split at this depth. <see cref="UsenetClient.StatPipelinedAsync"/> windows
     /// larger STAT batches internally at this depth.
     /// </remarks>
-    public int MaxPipelineDepth { get; init; } = 64;
+    public int MaxPipelineDepth { get; init; } = DefaultMaxPipelineDepth;
+
+    /// <summary>
+    /// The default <see cref="MaxPipelineDepth"/> applied when a caller specifies none.
+    /// Exposed so callers can report the depth actually in force without duplicating it.
+    /// </summary>
+    public const int DefaultMaxPipelineDepth = 64;
 
     /// <summary>
     /// Gets whether <see cref="UsenetClient.DecodedBodyAsync(UsenetSharp.Models.SegmentId, CancellationToken)"/>

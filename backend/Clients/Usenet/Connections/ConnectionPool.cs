@@ -148,12 +148,63 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
     (
         SemaphorePriority priority,
         CancellationToken cancellationToken = default
-    ) => GetConnectionLockCoreAsync(priority, preferIdle: true, cancellationToken);
+    ) => GetConnectionLockCoreAsync(priority, preferIdle: true, reservation: null, cancellationToken);
+
+    /// <summary>
+    /// Borrow a connection using a permit already held by <paramref name="reservation"/>,
+    /// so the caller does not queue on the gate a second time.
+    /// </summary>
+    public Task<ConnectionLock<T>> GetConnectionLockAsync
+    (
+        SemaphorePriority priority,
+        Reservation? reservation,
+        CancellationToken cancellationToken = default
+    ) => GetConnectionLockCoreAsync(priority, preferIdle: true, reservation, cancellationToken);
+
+    /// <summary>
+    /// Takes one real pool permit without queuing, or returns false. The permit is held by
+    /// the returned reservation until it is either consumed by
+    /// <see cref="GetConnectionLockAsync(SemaphorePriority, Reservation?, CancellationToken)"/>
+    /// or released by disposing it. Existing high/low gate waiters are never bypassed.
+    /// </summary>
+    public bool TryReserve(out Reservation? reservation)
+    {
+        if (Volatile.Read(ref _disposed) == 1 || !_gate.TryWait())
+        {
+            reservation = null;
+            return false;
+        }
+
+#pragma warning disable CA2000 // ownership transfers to the caller via the out parameter
+        reservation = new Reservation(this);
+#pragma warning restore CA2000
+        return true;
+    }
+
+    /// <summary>
+    /// One pool permit held on behalf of a caller that has not started borrowing yet.
+    /// Exactly one of <see cref="TryConsume"/> or <see cref="Dispose"/> takes effect.
+    /// </summary>
+    public sealed class Reservation(ConnectionPool<T> pool) : IDisposable
+    {
+        private int _settled;
+
+        internal bool Owns(ConnectionPool<T> candidate) => ReferenceEquals(pool, candidate);
+
+        internal bool TryConsume() => Interlocked.Exchange(ref _settled, 1) == 0;
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _settled, 1) != 0) return;
+            pool.ReleaseGateIfActive();
+        }
+    }
 
     private async Task<ConnectionLock<T>> GetConnectionLockCoreAsync
     (
         SemaphorePriority priority,
         bool preferIdle,
+        Reservation? reservation,
         CancellationToken cancellationToken
     )
     {
@@ -161,9 +212,23 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(
             cancellationToken, _sweepCts.Token);
 
-        var gateWaitStarted = Stopwatch.GetTimestamp();
-        await _gate.WaitAsync(priority, linked.Token).ConfigureAwait(false);
-        Interlocked.Add(ref _gateWaitTicks, Stopwatch.GetElapsedTime(gateWaitStarted).Ticks);
+        if (reservation is null)
+        {
+            var gateWaitStarted = Stopwatch.GetTimestamp();
+            await _gate.WaitAsync(priority, linked.Token).ConfigureAwait(false);
+            Interlocked.Add(ref _gateWaitTicks, Stopwatch.GetElapsedTime(gateWaitStarted).Ticks);
+        }
+        else
+        {
+            if (!reservation.Owns(this))
+                throw new InvalidOperationException(
+                    "Connection pool reservation belongs to a different pool.");
+            if (!reservation.TryConsume())
+                throw new InvalidOperationException(
+                    "Connection pool reservation was already consumed or released.");
+            // The permit is already held, so every failure path below releases it exactly
+            // as it would for a permit taken by waiting on the gate.
+        }
 
         // Claim an idle connection atomically with respect to disposal. Once popped,
         // it is active and disposal leaves it for the borrower to return or destroy.
@@ -508,7 +573,10 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
                 // A warm connection is borrowed only while it is being opened, then
                 // returned immediately. Cached warm connections never retain a gate permit.
                 using (await GetConnectionLockCoreAsync(
-                           SemaphorePriority.Low, preferIdle: false, cancellationToken: cancellationToken).ConfigureAwait(false))
+                           SemaphorePriority.Low,
+                           preferIdle: false,
+                           reservation: null,
+                           cancellationToken: cancellationToken).ConfigureAwait(false))
                 {
                     // Returning the lock to the pool establishes one idle warm connection.
                 }

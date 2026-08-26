@@ -111,6 +111,109 @@ public class ConnectionPoolStatsReplayTests
             websocketManager.PeekLastMessage(WebsocketTopic.UsenetConnections));
     }
 
+    [Fact]
+    public async Task FullySplitProviders_AppendAggregateTransferAndMetadataSummary()
+    {
+        var websocketManager = new WebsocketManager();
+        var connectionStats = new ConnectionPoolStats(
+            new UsenetProviderConfig
+            {
+                Providers =
+                [
+                    Provider(ProviderType.Pooled, max: 10, transfer: 6),
+                    Provider(ProviderType.BackupOnly, max: 8, transfer: 5),
+                ],
+            },
+            websocketManager);
+
+        connectionStats.GetOnConnectionPoolChanged(0)(
+            this,
+            new ConnectionPoolStats.ConnectionPoolChangedEventArgs(4, 1, 10));
+        connectionStats.GetOnConnectionPoolChanged(1)(
+            this,
+            new ConnectionPoolStats.ConnectionPoolChangedEventArgs(1, 0, 8));
+        connectionStats.GetOnConnectionAdmissionChanged(0)(
+            Admission(transferLimit: 6, metadataBase: 4, metadataMax: 7,
+                activeTransfers: 3, activeMetadata: 7));
+        connectionStats.GetOnConnectionAdmissionChanged(1)(
+            Admission(transferLimit: 5, metadataBase: 3, metadataMax: 5,
+                activeTransfers: 2, activeMetadata: 4));
+
+        // The whole payload is pooled-scoped: totals and the split summary both count
+        // only ProviderType.Pooled, matching the widget's "on pooled providers" label.
+        // The backup provider still gates whether the summary is emitted at all (it has
+        // a transfer limit), but contributes no counts of its own.
+        const string expected = "1|1|0|4|10|1|1|3|6|7|4|7";
+        await WaitUntil(() => websocketManager.PeekLastMessage(
+            WebsocketTopic.UsenetConnections) == expected);
+        Assert.Equal(
+            expected,
+            websocketManager.PeekLastMessage(WebsocketTopic.UsenetConnections));
+    }
+
+    [Fact]
+    public async Task MixedLegacyProviders_KeepLegacySummaryPayload()
+    {
+        var websocketManager = new WebsocketManager();
+        var connectionStats = new ConnectionPoolStats(
+            new UsenetProviderConfig
+            {
+                Providers =
+                [
+                    Provider(ProviderType.Pooled, max: 10, transfer: 6),
+                    Provider(ProviderType.BackupOnly, max: 8, transfer: null),
+                ],
+            },
+            websocketManager);
+
+        connectionStats.GetOnConnectionPoolChanged(0)(
+            this,
+            new ConnectionPoolStats.ConnectionPoolChangedEventArgs(4, 1, 10));
+        connectionStats.GetOnConnectionPoolChanged(1)(
+            this,
+            new ConnectionPoolStats.ConnectionPoolChangedEventArgs(1, 0, 8));
+
+        // Waiting for non-null would race the debounced flush: the constructor already
+        // published "reset", so the assertion could run before any pool message lands.
+        const string expected = "1|1|0|4|10|1";
+        await WaitUntil(() => websocketManager.PeekLastMessage(
+            WebsocketTopic.UsenetConnections) == expected);
+        Assert.Equal(
+            expected,
+            websocketManager.PeekLastMessage(WebsocketTopic.UsenetConnections));
+    }
+
+    private static UsenetProviderConfig.ConnectionDetails Provider(
+        ProviderType type,
+        int max,
+        int? transfer) => new()
+        {
+            Type = type,
+            Host = $"{type}.example.com",
+            Port = 563,
+            UseSsl = true,
+            User = "user",
+            Pass = "pass",
+            MaxConnections = max,
+            MaxTransferConnections = transfer,
+        };
+
+    private static ProviderConnectionAdmissionSnapshot Admission(
+        int transferLimit,
+        int metadataBase,
+        int metadataMax,
+        int activeTransfers,
+        int activeMetadata) => new(
+        ConfiguredTransferLimit: transferLimit,
+        EffectiveTransferLimit: transferLimit,
+        BaseMetadataCapacity: metadataBase,
+        MetadataBurstAllowance: metadataMax - metadataBase,
+        MaxMetadataCapacity: metadataMax,
+        ActiveTransferOperations: activeTransfers,
+        ActiveMetadataOperations: activeMetadata,
+        WaitingTransferOperations: 0,
+        WaitingMetadataOperations: 0);
+
     private static async Task WaitUntil(Func<bool> condition)
     {
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(2));
