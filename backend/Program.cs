@@ -17,6 +17,7 @@ using NzbWebDAV.Api.SabControllers;
 using NzbWebDAV.Auth;
 using NzbWebDAV.Clients.Rclone;
 using NzbWebDAV.Clients.Usenet;
+using NzbWebDAV.Clients.Usenet.Connections;
 using NzbWebDAV.Config;
 using NzbWebDAV.Database;
 using NzbWebDAV.Exceptions;
@@ -326,6 +327,10 @@ public partial class Program
                     new ProviderUsageTracker(sp.GetRequiredService<ActiveReadRegistry>()))
                 .AddSingleton<QueueItemSourceTracker>()
                 .AddSingleton<StreamingFailureTracker>()
+                .AddSingleton<HealthCheckConnectionGate>()
+                .AddSingleton<HealthCheckProviderAdmissionRegistry>()
+                .AddSingleton<HealthCheckStatScheduler>()
+                .AddHostedService(sp => sp.GetRequiredService<HealthCheckStatScheduler>())
                 .AddSingleton<UsenetStreamingClient>()
                 .AddHostedService<ProviderRecoveryProbeService>()
                 // LazyRarResolver takes INntpClient (for testability) but must

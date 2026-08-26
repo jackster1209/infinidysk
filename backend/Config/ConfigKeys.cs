@@ -40,6 +40,7 @@ public static class ConfigKeys
     public const string UsenetContainerAwareFill = "usenet.container-aware-fill";
     public const string UsenetInFlightArticleBudgetMb = "usenet.in-flight-article-budget-mb";
     public const string UsenetCascadeEnabled = "usenet.cascade.enabled";
+    public const string UsenetVerificationRouting = "usenet.verification-routing.enabled";
     public const string UsenetCascadeRetryPrimaryOnMiss = "usenet.cascade.retry-primary-on-miss";
     public const string UsenetIdleConnectionTimeoutSeconds = "usenet.idle-connection-timeout-seconds";
     public const string UsenetWarmConnectionsEnabled = "usenet.warm-connections.enabled";
@@ -90,6 +91,7 @@ public static class ConfigKeys
     public const string MediaLibraryDir = "media.library-dir";
     public const string RepairEnable = "repair.enable";
     public const string RepairHealthcheckConcurrency = "repair.healthcheck-concurrency";
+    public const string RepairHealthcheckWorkers = "repair.healthcheck-workers";
     public const string RepairHealthcheckDepth = "repair.healthcheck-depth";
     public const string RepairHealthcheckAging = "repair.healthcheck-aging";
     public const string RepairAutoRemoveAfterFailures = "repair.auto-remove-after-failures";

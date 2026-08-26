@@ -200,7 +200,9 @@ public sealed class RepairPatchStore
         lock (_evictLock)
         {
             if (_currentBytes <= _maxBytes) return;
-            foreach (var kv in _index.OrderBy(x => x.Value.LastAccessTicks).ToList())
+            // Snapshot atomically: _evictLock serializes evictors but not writers, so
+            // ordering the dictionary directly can still tear the ICollection copy.
+            foreach (var kv in _index.ToArray().OrderBy(x => x.Value.LastAccessTicks))
             {
                 if (_currentBytes <= _maxBytes) break;
                 if (!_index.TryRemove(kv.Key, out var entry)) continue;

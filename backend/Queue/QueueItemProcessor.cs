@@ -40,6 +40,7 @@ public class QueueItemProcessor(
     IProgress<int> progress,
     ConcurrentDictionary<Guid, int> retryAttempts,
     SemaphoreSlim? finalizeLock,
+    HealthCheckConnectionGate healthCheckConnectionGate,
     CancellationToken ct,
     Action<string>? stageReporter = null
 )
@@ -53,6 +54,7 @@ public class QueueItemProcessor(
         ConfigManager configManager,
         WebsocketManager websocketManager,
         IProgress<int> progress,
+        HealthCheckConnectionGate healthCheckConnectionGate,
         CancellationToken ct)
         : this(
             queueItem,
@@ -67,7 +69,8 @@ public class QueueItemProcessor(
             progress,
             new ConcurrentDictionary<Guid, int>(),
             finalizeLock: null,
-            ct)
+            healthCheckConnectionGate,
+            ct: ct)
     {
     }
 
@@ -477,9 +480,15 @@ public class QueueItemProcessor(
             var part3Progress = progress
                 .Offset(100)
                 .ToPercentage(articlesToCheck.Count);
-            var healthCheckConcurrency = Math.Min(
-                configManager.GetHealthCheckConcurrency(),
-                QueueFanOut.GetConcurrency(configManager, ct));
+            // In Auto the queue stage stays bounded by queue fan-out plus provider and pool
+            // admission; an explicit ceiling continues to apply to queue verification too.
+            var queueFanOut = QueueFanOut.GetConcurrency(configManager, ct);
+            var healthCheckConcurrency = configManager.GetHealthCheckCeiling() is { } ceiling
+                ? Math.Min(ceiling, queueFanOut)
+                : queueFanOut;
+            using var healthAdmissionScope = ct.SetContext(new HealthCheckAdmissionContext(
+                healthCheckConnectionGate,
+                HealthCheckAdmissionPriority.Queue));
             await RunStageAsync(
                     "health",
                     () => ArticleExistenceChecker

@@ -405,7 +405,6 @@ public class ConfigManager : IConfigReader, IConfigUpdater, IConfigChangeSource
                 case ConfigKeys.WatchtowerSeriesRecentCount:
                 case ConfigKeys.WatchtowerSeasonBundleFallbackRecentCount:
                 case ConfigKeys.WatchtowerSeasonBundleFallbackMaxEpisodes:
-                case ConfigKeys.RepairHealthcheckConcurrency:
                 case ConfigKeys.RepairAutoRemoveAfterFailures:
                 case ConfigKeys.DatabaseHistoryRetentionDays:
                 case ConfigKeys.DatabaseHealthcheckRetentionDays:
@@ -415,6 +414,19 @@ public class ConfigManager : IConfigReader, IConfigUpdater, IConfigChangeSource
                 case ConfigKeys.ApiNzbBackupRetentionDays:
                 case ConfigKeys.QueueSpeedLimitKbps:
                     RequireLong(item.ConfigName, value);
+                    break;
+
+                case ConfigKeys.RepairHealthcheckConcurrency:
+                    // Auto (absent, blank, or "auto") means no aggregate ceiling. Numeric
+                    // values persisted by earlier releases keep validating; the getter
+                    // applies the current safe runtime bounds without making upgrades
+                    // fail configuration validation.
+                    if (!IsAutoHealthCheckCeiling(value))
+                        RequireLong(item.ConfigName, value);
+                    break;
+
+                case ConfigKeys.RepairHealthcheckWorkers:
+                    RequireLongInRange(item.ConfigName, value, 1, 8);
                     break;
 
                 case ConfigKeys.ProwlarrSyncIntervalMinutes:
@@ -656,6 +668,13 @@ public class ConfigManager : IConfigReader, IConfigUpdater, IConfigChangeSource
                     throw new ArgumentException($"Provider '{label}': port must be between 1 and 65535, but was {p.Port}.");
                 if (p.MaxConnections < 1)
                     throw new ArgumentException($"Provider '{label}': max connections must be at least 1, but was {p.MaxConnections}.");
+                if (p.MaxTransferConnections is < 1)
+                    throw new ArgumentException(
+                        $"Provider '{label}': transfer connections must be at least 1, but was {p.MaxTransferConnections}.");
+                if (p.MaxTransferConnections > p.MaxConnections)
+                    throw new ArgumentException(
+                        $"Provider '{label}': transfer connections must not exceed max connections " +
+                        $"({p.MaxConnections}), but was {p.MaxTransferConnections}.");
                 if (p.ByteLimit is < 0)
                     throw new ArgumentException($"Provider '{label}': byte limit must not be negative.");
             }
@@ -910,6 +929,19 @@ public class ConfigManager : IConfigReader, IConfigUpdater, IConfigChangeSource
     {
         var v = StringUtil.EmptyToNull(GetAliasedConfigValue(ConfigKeys.UsenetQueuePipeliningEnabled));
         return v is not null && bool.TryParse(v, out var enabled) && enabled;
+    }
+
+    /// <summary>
+    /// Rank providers for bulk verification (STAT) by how often they actually hold the
+    /// articles being checked, instead of by transfer-oriented tier and spare capacity.
+    /// A STAT moves no payload, so the pooled/backup distinction that protects metered
+    /// transfer bytes does not apply to it; asking a provider that lacks the article is
+    /// the only real cost. Default on. Does not affect BODY/ARTICLE routing.
+    /// </summary>
+    public bool IsVerificationRoutingEnabled()
+    {
+        var v = StringUtil.EmptyToNull(GetConfigValue(ConfigKeys.UsenetVerificationRouting));
+        return v is null || !bool.TryParse(v, out var enabled) || enabled;
     }
 
     public bool IsCascadeEnabled()
@@ -1870,17 +1902,52 @@ public class ConfigManager : IConfigReader, IConfigUpdater, IConfigChangeSource
     }
 
     /// <summary>
-    /// Max concurrent NNTP STAT connections for health checks.
-    /// Capped at the configured provider pool size to avoid pool starvation.
+    /// Optional aggregate ceiling on NNTP verification connections shared by background
+    /// health checks and queue article-existence validation.
+    /// <para>
+    /// Returns <c>null</c> for Auto, meaning no aggregate ceiling: provider metadata
+    /// admission and the physical connection pools decide what is executable. A ceiling
+    /// can constrain executable capacity but can never create it, so a stored numeric
+    /// value is preserved as an explicit override rather than reinterpreted as Auto.
+    /// </para>
     /// </summary>
-    public int GetHealthCheckConcurrency()
+    public int? GetHealthCheckCeiling()
     {
-        var poolSize = GetUsenetProviderConfig().TotalPooledConnections;
-        var configured = int.Parse(
-            StringUtil.EmptyToNull(GetConfigValue(ConfigKeys.RepairHealthcheckConcurrency))
-            ?? "50"
-        );
-        return Math.Clamp(configured, 1, Math.Max(1, poolSize));
+        var configured = StringUtil.EmptyToNull(
+            GetConfigValue(ConfigKeys.RepairHealthcheckConcurrency)?.Trim());
+        if (configured is null || IsAutoHealthCheckCeiling(configured)) return null;
+        if (!long.TryParse(configured, out var parsed)) return null;
+
+        var poolSize = Math.Max(1, GetUsenetProviderConfig().TotalPooledConnections);
+        var maximum = Math.Min(200, poolSize);
+        return (int)Math.Clamp(parsed, 1L, maximum);
+    }
+
+    public static bool IsAutoHealthCheckCeiling(string? value) =>
+        StringUtil.EmptyToNull(value?.Trim()) is not { } configured
+        || configured.Equals("auto", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Maximum number of library files that may be health-checked concurrently.
+    /// Each worker shares the aggregate health connection limit above.
+    /// </summary>
+    public int GetHealthCheckWorkers()
+    {
+        var configured = StringUtil.EmptyToNull(GetConfigValue(ConfigKeys.RepairHealthcheckWorkers));
+        return int.TryParse(configured, out var value) ? Math.Clamp(value, 1, 8) : 1;
+    }
+
+    /// <summary>
+    /// Routine background verification may coexist with queue processing only when
+    /// every enabled provider explicitly uses split Transfer/Metadata scheduling.
+    /// </summary>
+    public bool CanBackgroundHealthCoexistWithQueue()
+    {
+        var enabledProviders = GetUsenetProviderConfig().Providers
+            .Where(provider => provider.Type != ProviderType.Disabled)
+            .ToList();
+        return enabledProviders.Count > 0
+               && enabledProviders.All(provider => provider.MaxTransferConnections.HasValue);
     }
 
     /// <summary>

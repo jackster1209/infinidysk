@@ -17,6 +17,7 @@ using NzbWebDAV.Models.Nzb;
 using NzbWebDAV.Queue;
 using NzbWebDAV.Queue.DeobfuscationSteps._3.GetFileInfos;
 using NzbWebDAV.Queue.FileProcessors;
+using NzbWebDAV.Services;
 using NzbWebDAV.Streams;
 using NzbWebDAV.Tests.TestUtils;
 using NzbWebDAV.Websocket;
@@ -459,6 +460,8 @@ public sealed class QueueRarTimeoutQueueItemTests : IAsyncLifetime
         var secondId = $"rar-timeout-second-{Guid.NewGuid():N}@example.com";
         using var client = new QueueRarTimeoutTests.ScriptedRarNntpClient { ThrowOnGetFileStream = true };
         var queueItem = await SeedQueueItemAsync(firstId, secondId);
+        var configManager = new ConfigManager();
+        using var healthCheckConnectionGate = new HealthCheckConnectionGate(configManager);
 
         await using var nzbStream = CreateNzbStream(firstId, secondId);
         var processor = new QueueItemProcessor(
@@ -466,9 +469,10 @@ public sealed class QueueRarTimeoutQueueItemTests : IAsyncLifetime
             nzbStream,
             _dbClient,
             client,
-            new ConfigManager(),
+            configManager,
             new WebsocketManager(),
             new Progress<int>(),
+            healthCheckConnectionGate,
             CancellationToken.None);
         await processor.ProcessAsync();
 
@@ -489,6 +493,8 @@ public sealed class QueueRarTimeoutQueueItemTests : IAsyncLifetime
         var secondId = $"rar-cancel-second-{Guid.NewGuid():N}@example.com";
         using var client = new QueueRarTimeoutTests.ScriptedRarNntpClient();
         var queueItem = await SeedQueueItemAsync(firstId, secondId);
+        var configManager = new ConfigManager();
+        using var healthCheckConnectionGate = new HealthCheckConnectionGate(configManager);
         using var cts = new CancellationTokenSource();
         await cts.CancelAsync();
 
@@ -498,9 +504,10 @@ public sealed class QueueRarTimeoutQueueItemTests : IAsyncLifetime
             nzbStream,
             _dbClient,
             client,
-            new ConfigManager(),
+            configManager,
             new WebsocketManager(),
             new Progress<int>(),
+            healthCheckConnectionGate,
             cts.Token);
         await processor.ProcessAsync();
 
@@ -632,15 +639,18 @@ public sealed class QueueRarTimeoutLoggingTests : IAsyncLifetime
             .CreateLogger();
         try
         {
+            var configManager = new ConfigManager();
+            using var healthCheckConnectionGate = new HealthCheckConnectionGate(configManager);
             await using var nzbStream = new MemoryStream(nzb);
             var processor = new QueueItemProcessor(
                 queueItem,
                 nzbStream,
                 _dbClient,
                 client,
-                new ConfigManager(),
+                configManager,
                 new WebsocketManager(),
                 new Progress<int>(),
+                healthCheckConnectionGate,
                 CancellationToken.None);
             await processor.ProcessAsync();
         }

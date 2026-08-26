@@ -1,6 +1,11 @@
+using System.Text.Json;
 using NzbWebDAV.Clients.Usenet;
 using NzbWebDAV.Clients.Usenet.Models;
+using NzbWebDAV.Config;
+using NzbWebDAV.Database.Models;
 using NzbWebDAV.Exceptions;
+using NzbWebDAV.Models;
+using NzbWebDAV.Services;
 using UsenetSharp.Exceptions;
 using UsenetSharp.Models;
 using UsenetSharp.Streams;
@@ -46,6 +51,235 @@ public class NntpClientCheckAllSegmentsTests
         var client = new StatCodeClient(223);
 
         await client.CheckAllSegmentsAsync(["seg@example"], 1, null, CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task CheckAllSegmentsAsync_KeepsWorkerSlotsFedAfterInitialBurst()
+    {
+        const int concurrency = 12;
+        var initialStarted = 0;
+        var initialFinished = 0;
+        var refillActive = 0;
+        var invocation = 0;
+        var releaseInitial = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var initialDrained = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var refillReached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseRefill = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var client = new DelegateStatClient(async (segmentId, cancellationToken) =>
+        {
+            if (Interlocked.Increment(ref invocation) <= concurrency)
+            {
+                if (Interlocked.Increment(ref initialStarted) == concurrency)
+                    releaseInitial.TrySetResult();
+                await releaseInitial.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+                if (Interlocked.Increment(ref initialFinished) == concurrency)
+                    initialDrained.TrySetResult();
+                await initialDrained.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+                return Exists(segmentId);
+            }
+
+            var current = Interlocked.Increment(ref refillActive);
+            if (current >= concurrency - 1) refillReached.TrySetResult();
+            try
+            {
+                await releaseRefill.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+                return Exists(segmentId);
+            }
+            finally
+            {
+                Interlocked.Decrement(ref refillActive);
+            }
+        });
+        var refillObservedBeforeFirstProgressReturned = false;
+        var firstProgressReport = 0;
+        var progress = new CallbackProgress(_ =>
+        {
+            // Progress coalesces behind a slow callback, so the first report carries whatever
+            // count had accumulated by the time the forwarder reached it — pinning this to a
+            // value of 1 made the test depend on losing that race.
+            if (Interlocked.Exchange(ref firstProgressReport, 1) != 0) return;
+            refillObservedBeforeFirstProgressReturned = refillReached.Task.Wait(TimeSpan.FromSeconds(5));
+            releaseRefill.TrySetResult();
+        });
+
+        await client.CheckAllSegmentsAsync(
+            Enumerable.Range(0, 36).Select(index => $"segment-{index}@example"),
+            concurrency,
+            progress,
+            CancellationToken.None);
+
+        Assert.True(refillObservedBeforeFirstProgressReturned);
+    }
+
+    [Fact]
+    public async Task CheckAllSegmentsAsync_CoalescesSlowProgressWithoutReportingBackwards()
+    {
+        const int segmentCount = 8;
+        var completedStats = 0;
+        var releaseStats = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var allStatsCompleted = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var client = new DelegateStatClient(async (segmentId, cancellationToken) =>
+        {
+            await releaseStats.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+            if (Interlocked.Increment(ref completedStats) == segmentCount)
+                allStatsCompleted.TrySetResult();
+            return Exists(segmentId);
+        });
+        var firstReportEntered = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseFirstReport = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var reports = new List<int>();
+        var firstReport = 0;
+        var progress = new CallbackProgress(value =>
+        {
+            // Hold whichever report arrives first, whatever count it carries. Coalescing is
+            // the behaviour under test, so the first report is exactly the one that must not
+            // be assumed to be 1.
+            if (Interlocked.Exchange(ref firstReport, 1) == 0)
+            {
+                firstReportEntered.TrySetResult();
+                releaseFirstReport.Task.GetAwaiter().GetResult();
+            }
+
+            lock (reports) reports.Add(value);
+        });
+
+        var check = client.CheckAllSegmentsAsync(
+            Enumerable.Range(0, segmentCount).Select(index => $"segment-{index}@example"),
+            concurrency: 4,
+            progress,
+            CancellationToken.None);
+
+        releaseStats.TrySetResult();
+        await firstReportEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await allStatsCompleted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        releaseFirstReport.TrySetResult();
+        await check;
+
+        int[] snapshot;
+        lock (reports) snapshot = reports.ToArray();
+        Assert.Equal(segmentCount, snapshot[^1]);
+        Assert.True(snapshot.SequenceEqual(snapshot.Order()));
+    }
+
+    [Fact]
+    public async Task ConcurrentChecks_KeepSharedHealthGateFedAfterInitialBursts()
+    {
+        const int gateLimit = 12;
+        const int checkCount = 3;
+        using var gate = new HealthCheckConnectionGate(CreateGateConfig(gateLimit));
+        var initialFinished = 0;
+        var refillObserved = 0;
+        var observer = 0;
+        using var firstProgressBarrier = new CountdownEvent(checkCount);
+        var allInitialFinished = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var gateRefilled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseRefill = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var checks = Enumerable.Range(0, checkCount).Select(checkIndex =>
+        {
+            var invocation = 0;
+            var client = new DelegateStatClient(async (segmentId, cancellationToken) =>
+            {
+                await Task.Yield();
+                var currentInvocation = Interlocked.Increment(ref invocation);
+                if (currentInvocation > gateLimit)
+                    await allInitialFinished.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+                using var lease = await gate.AcquireAsync(
+                    HealthCheckAdmissionPriority.Background,
+                    cancellationToken).ConfigureAwait(false);
+                if (currentInvocation <= gateLimit)
+                {
+                    if (Interlocked.Increment(ref initialFinished) == gateLimit * checkCount)
+                        allInitialFinished.TrySetResult();
+                    return Exists(segmentId);
+                }
+
+                if (gate.GetSnapshot().Active >= gateLimit) gateRefilled.TrySetResult();
+                await releaseRefill.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+                return Exists(segmentId);
+            });
+            var firstProgressReport = 0;
+            var progress = new CallbackProgress(_ =>
+            {
+                // One shot per check, on its first report. The report's value coalesces and
+                // is not guaranteed to be 1; gating on that let this check silently never
+                // release the refill STATs it is meant to observe.
+                if (Interlocked.Exchange(ref firstProgressReport, 1) != 0) return;
+                var initialObserved = allInitialFinished.Task.Wait(TimeSpan.FromSeconds(5));
+                firstProgressBarrier.Signal();
+                var barrierObserved = firstProgressBarrier.Wait(TimeSpan.FromSeconds(5));
+                if (!initialObserved || !barrierObserved)
+                {
+                    releaseRefill.TrySetResult();
+                    return;
+                }
+                if (Interlocked.CompareExchange(ref observer, 1, 0) == 0)
+                {
+                    if (gateRefilled.Task.Wait(TimeSpan.FromSeconds(5)))
+                        Volatile.Write(ref refillObserved, 1);
+                    releaseRefill.TrySetResult();
+                }
+                else
+                {
+                    releaseRefill.Task.GetAwaiter().GetResult();
+                }
+            });
+
+            return client.CheckAllSegmentsAsync(
+                Enumerable.Range(0, 36).Select(index => $"check-{checkIndex}-segment-{index}@example"),
+                gateLimit,
+                progress,
+                CancellationToken.None);
+        });
+
+        await Task.WhenAll(checks);
+
+        Assert.Equal(1, Volatile.Read(ref refillObserved));
+    }
+
+    [Fact]
+    public async Task CheckAllSegmentsAsync_MissingSegmentCancelsAndDrainsSiblingWorkers()
+    {
+        var allStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var started = 0;
+        var drained = 0;
+        var client = new DelegateStatClient(async (segmentId, cancellationToken) =>
+        {
+            if (Interlocked.Increment(ref started) == 3) allStarted.TrySetResult();
+            await allStarted.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+            if (segmentId.ToString() == "missing@example")
+            {
+                return new UsenetStatResponse
+                {
+                    ResponseCode = 430,
+                    ResponseMessage = "430 missing",
+                    ArticleExists = false,
+                };
+            }
+
+            try
+            {
+                await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken).ConfigureAwait(false);
+                return Exists(segmentId);
+            }
+            finally
+            {
+                Interlocked.Increment(ref drained);
+            }
+        });
+
+        await Assert.ThrowsAsync<UsenetArticleNotFoundException>(() =>
+            client.CheckAllSegmentsAsync(
+                ["missing@example", "sibling-1@example", "sibling-2@example"],
+                concurrency: 3,
+                progress: null,
+                CancellationToken.None));
+
+        Assert.Equal(2, drained);
     }
 
     [Fact]
@@ -267,6 +501,52 @@ public class NntpClientCheckAllSegmentsTests
         public void Report(int value) => reports.Add(value);
     }
 
+    private sealed class CallbackProgress(Action<int> onReport) : IProgress<int>
+    {
+        public void Report(int value) => onReport(value);
+    }
+
+    private static UsenetStatResponse Exists(SegmentId segmentId) => new()
+    {
+        ResponseCode = (int)UsenetResponseType.ArticleExists,
+        ResponseMessage = $"223 <{segmentId}>",
+        ArticleExists = true,
+    };
+
+    private static ConfigManager CreateGateConfig(int limit)
+    {
+        var config = new ConfigManager();
+        config.UpdateValues([
+            new ConfigItem
+            {
+                ConfigName = ConfigKeys.UsenetProviders,
+                ConfigValue = JsonSerializer.Serialize(new UsenetProviderConfig
+                {
+                    Providers =
+                    [
+                        new UsenetProviderConfig.ConnectionDetails
+                        {
+                            ProviderId = Guid.NewGuid(),
+                            Type = ProviderType.Pooled,
+                            Host = "gate.example",
+                            Port = 563,
+                            UseSsl = true,
+                            User = "user",
+                            Pass = "pass",
+                            MaxConnections = 50,
+                        },
+                    ],
+                }),
+            },
+            new ConfigItem
+            {
+                ConfigName = ConfigKeys.RepairHealthcheckConcurrency,
+                ConfigValue = limit.ToString(),
+            },
+        ]);
+        return config;
+    }
+
     [Fact]
     public async Task MapPipelinedBodyResult_With451_ReportsNotFound()
     {
@@ -315,6 +595,7 @@ public class NntpClientCheckAllSegmentsTests
                 {
                     SegmentId = segmentIds[i],
                     Exists = pipelinedExists![i],
+                    DefinitivelyMissing = !pipelinedExists[i],
                 };
             }
         }
@@ -364,6 +645,59 @@ public class NntpClientCheckAllSegmentsTests
                 ArticleExists = code == (int)UsenetResponseType.ArticleExists,
             });
         }
+
+        public override Task<UsenetHeadResponse> HeadAsync(
+            SegmentId segmentId, CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+
+        public override Task<UsenetDecodedBodyResponse> DecodedBodyAsync(
+            SegmentId segmentId, CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+
+        public override Task<UsenetDecodedBodyResponse> DecodedBodyAsync(
+            SegmentId segmentId,
+            ArticleBodyCompletionHandler? onConnectionReadyAgain,
+            CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+
+        public override Task<UsenetDecodedBodyBatch> DecodedBodiesAsync(
+            IReadOnlyList<SegmentId> segmentIds,
+            ArticleBodyCompletionHandler? onConnectionReadyAgain,
+            CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+
+        public override Task<UsenetDecodedArticleResponse> DecodedArticleAsync(
+            SegmentId segmentId, CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+
+        public override Task<UsenetDecodedArticleResponse> DecodedArticleAsync(
+            SegmentId segmentId,
+            ArticleBodyCompletionHandler? onConnectionReadyAgain,
+            CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+
+        public override Task<UsenetDateResponse> DateAsync(CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+
+        public override void Dispose()
+        {
+        }
+    }
+
+    private sealed class DelegateStatClient(
+        Func<SegmentId, CancellationToken, Task<UsenetStatResponse>> stat) : NntpClient
+    {
+        public override Task ConnectAsync(
+            string host, int port, bool useSsl, CancellationToken cancellationToken) =>
+            Task.CompletedTask;
+
+        public override Task<UsenetResponse> AuthenticateAsync(
+            string user, string pass, CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+
+        public override Task<UsenetStatResponse> StatAsync(
+            SegmentId segmentId, CancellationToken cancellationToken) =>
+            stat(segmentId, cancellationToken);
 
         public override Task<UsenetHeadResponse> HeadAsync(
             SegmentId segmentId, CancellationToken cancellationToken) =>
