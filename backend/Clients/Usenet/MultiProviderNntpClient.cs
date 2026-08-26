@@ -32,6 +32,7 @@ public class MultiProviderNntpClient : NntpClient, INntpConnectionStats
     private readonly ProviderBytesTracker? bytesTracker;
     private readonly Func<bool>? cascadeEnabled;
     private readonly Func<bool>? retryPrimaryOnMiss;
+    private readonly Func<bool>? verificationRoutingEnabled;
     private readonly StreamTraceBuffer? streamTrace;
     private readonly ActiveReadRegistry? activeReadRegistry;
     private readonly ArticleMissNegativeCache? articleMissCache;
@@ -45,6 +46,7 @@ public class MultiProviderNntpClient : NntpClient, INntpConnectionStats
         ProviderBytesTracker? bytesTracker = null,
         Func<bool>? cascadeEnabled = null,
         Func<bool>? retryPrimaryOnMiss = null,
+        Func<bool>? verificationRoutingEnabled = null,
         StreamTraceBuffer? streamTrace = null,
         ActiveReadRegistry? activeReadRegistry = null,
         ArticleMissNegativeCache? articleMissCache = null,
@@ -58,11 +60,13 @@ public class MultiProviderNntpClient : NntpClient, INntpConnectionStats
         this.bytesTracker = bytesTracker;
         this.cascadeEnabled = cascadeEnabled;
         this.retryPrimaryOnMiss = retryPrimaryOnMiss;
+        this.verificationRoutingEnabled = verificationRoutingEnabled;
         this.streamTrace = streamTrace;
         this.activeReadRegistry = activeReadRegistry;
         this.articleMissCache = articleMissCache;
         this.connectionPoolStats = connectionPoolStats;
         this.concurrentReadTracker = concurrentReadTracker;
+        VerificationCoverage = new ProviderVerificationCoverage(LogCoverageTransition, timeProvider);
         HealthAdmissionGeneration = new HealthCheckProviderGeneration(
             this,
             providers);
@@ -75,6 +79,12 @@ public class MultiProviderNntpClient : NntpClient, INntpConnectionStats
     /// </summary>
     private const int MaxConcurrentFallbackStarts = 4;
     private readonly SemaphoreSlim _batchFallbackStartGate = new(MaxConcurrentFallbackStarts);
+    /// <summary>
+    /// Per-provider verification coverage state, learned from this client's own definitive
+    /// STAT answers. Negative-only: it can move a provider later within its configured tier,
+    /// never earlier.
+    /// </summary>
+    internal ProviderVerificationCoverage VerificationCoverage { get; }
     internal HealthCheckProviderGeneration HealthAdmissionGeneration { get; }
     public int InFlightConnections =>
         providers.Sum(p => p.InFlightConnections) + HealthAdmissionGeneration.ActivePins;
@@ -118,7 +128,8 @@ public class MultiProviderNntpClient : NntpClient, INntpConnectionStats
                 p.EffectiveMaxConnections,
                 p.GetConnectionAdmissionSnapshot(),
                 p.EffectiveStatPipelineDepth,
-                p.ConfiguredPipeliningDepth))
+                p.ConfiguredPipeliningDepth,
+                VerificationCoverage.GetSnapshot(p.MetricsKey)))
             .ToList();
     }
 
@@ -1527,6 +1538,18 @@ public class MultiProviderNntpClient : NntpClient, INntpConnectionStats
     private static string NormalizeStorageGroup(string? value) => value?.Trim() ?? "";
 
     /// <summary>
+    /// Verification-specific ordering applies only to a STAT operation carrying a
+    /// health-check admission context. The context can also cover a bounded BODY read during
+    /// container classification, but transfer routing must retain the configured pool tiers.
+    /// </summary>
+    private bool IsVerificationRouting(
+        NntpOperation operation,
+        CancellationToken cancellationToken) =>
+        verificationRoutingEnabled?.Invoke() != false
+        && IsVerificationOperation(operation)
+        && cancellationToken.GetContext<HealthCheckAdmissionContext>() is not null;
+
+    /// <summary>
     /// STAT is the verification primitive: background health checks and queue article
     /// validation resolve every segment through it. The SegmentFetch families describe
     /// transfers and deliberately record nothing for a successful STAT, so walk depth and
@@ -1544,6 +1567,54 @@ public class MultiProviderNntpClient : NntpClient, INntpConnectionStats
     {
         if (!IsVerificationOperation(operation)) return;
         PrometheusMetrics.Current?.RecordStatAttempt(providerKey, result, elapsed);
+        RecordVerificationCoverage(providerKey, result);
+    }
+
+    /// <summary>
+    /// The single place a STAT answer becomes coverage evidence. Both verification paths — the
+    /// singular provider walk and the pipelined sweep — classify through here, so the rule for
+    /// what counts cannot drift between them and one logical answer is weighed exactly once.
+    ///
+    /// Only definitive answers say anything about coverage. An error means the provider did not
+    /// answer, not that it lacks the article, so it must never demote it; ids a pipelined sweep
+    /// leaves unanswered never reach here at all.
+    /// </summary>
+    private void RecordVerificationCoverage(string providerKey, string statResult)
+    {
+        if (statResult is "exists" or "missing")
+            VerificationCoverage.Record(providerKey, statResult == "exists");
+    }
+
+    /// <summary>
+    /// Announces a verification coverage state change. Logged here rather than inside the
+    /// tracker so the line names the provider's host rather than its metrics key.
+    /// </summary>
+    private void LogCoverageTransition(VerificationCoverageTransition transition)
+    {
+        var host = providers
+            .FirstOrDefault(p => string.Equals(
+                p.MetricsKey, transition.ProviderKey, StringComparison.Ordinal))
+            ?.Host ?? transition.ProviderKey;
+
+        if (transition.State == VerificationCoverageState.Deprioritized)
+        {
+            Log.Information(
+                "Provider `{Host}` definitively missed {MissRate:P0} of its recent verification "
+                + "requests over {Samples} answers. Health checks will try it later within its "
+                + "configured tier until fresh evidence improves",
+                host,
+                transition.MissRate,
+                transition.Samples);
+        }
+        else
+        {
+            Log.Information(
+                "Provider `{Host}` verification coverage recovered at {MissRate:P0} recent misses "
+                + "over {Samples} answers. Health checks restore its configured order",
+                host,
+                transition.MissRate,
+                transition.Samples);
+        }
     }
 
     private static void RecordStatWalk(
@@ -1685,6 +1756,7 @@ public class MultiProviderNntpClient : NntpClient, INntpConnectionStats
                     : result.DefinitivelyMissing ? "missing" : "error";
                 PrometheusMetrics.Current?.RecordStatAttempt(
                     provider.MetricsKey, statResult, elapsed);
+                RecordVerificationCoverage(provider.MetricsKey, statResult);
 
                 if (result.Exists) continue;
                 if (result.DefinitivelyMissing)
@@ -1773,6 +1845,30 @@ public class MultiProviderNntpClient : NntpClient, INntpConnectionStats
             // account. A provider that may still be down should not stall a request a
             // healthy peer would serve. The failover walk reaches it and any command it
             // completes resets the breaker.
+            // Bulk verification keeps the configured provider topology and only defends
+            // against it. Tier is absolute: every eligible pooled provider is verified before
+            // any backup or block account, whatever their measured retention, because a
+            // provider configured as a backup is a backup even when it holds everything.
+            // A STAT moves no payload, so the spare-capacity ordering that protects metered
+            // transfer bytes earns nothing here — but a provider that definitively misses
+            // most of what verification asks costs a full round trip per id to return nothing.
+            // ProviderVerificationCoverage measures that alone, and only downward: sustained
+            // recent absence moves a provider later among its own tier, and success never
+            // moves one earlier than it was configured. Coverage outranks Priority inside a
+            // tier so a first-phase provider that is currently empty does not cost every file
+            // a wasted phase; it can never outrank the tier itself.
+            if (IsVerificationRouting(operation, cancellationToken))
+            {
+                return pool
+                    .OrderBy(x => x.ProviderType)
+                    .ThenBy(x => circuitStates[x] == ProviderCircuitState.HalfOpen ? 1 : 0)
+                    .ThenBy(x => VerificationCoverage.GetState(x.MetricsKey)
+                        == VerificationCoverageState.Deprioritized ? 1 : 0)
+                    .ThenBy(x => x.Priority)
+                    .ThenBy(EstimatedDeliveryScore)
+                    .ToList();
+            }
+
             var byTier = pool.OrderBy(x => x.ProviderType);
             var byRecovery = byTier.ThenBy(x =>
                 circuitStates[x] == ProviderCircuitState.HalfOpen ? 1 : 0);
