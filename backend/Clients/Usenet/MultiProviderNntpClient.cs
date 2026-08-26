@@ -24,21 +24,49 @@ using UsenetSharp.Streams;
 
 namespace NzbWebDAV.Clients.Usenet;
 
-public class MultiProviderNntpClient(
-    List<MultiConnectionNntpClient> providers,
-    ProviderUsageTracker? usageTracker = null,
-    MetricsWriter? metricsWriter = null,
-    ProviderBytesTracker? bytesTracker = null,
-    Func<bool>? cascadeEnabled = null,
-    Func<bool>? retryPrimaryOnMiss = null,
-    StreamTraceBuffer? streamTrace = null,
-    ActiveReadRegistry? activeReadRegistry = null,
-    ArticleMissNegativeCache? articleMissCache = null,
-    ConnectionPoolStats? connectionPoolStats = null,
-    ConcurrentReadTracker? concurrentReadTracker = null
-) : NntpClient, INntpConnectionStats
+public class MultiProviderNntpClient : NntpClient, INntpConnectionStats
 {
     private static readonly TimeSpan RecoveryProbeTimeout = TimeSpan.FromSeconds(15);
+    private readonly List<MultiConnectionNntpClient> providers;
+    private readonly MetricsWriter? metricsWriter;
+    private readonly ProviderBytesTracker? bytesTracker;
+    private readonly Func<bool>? cascadeEnabled;
+    private readonly Func<bool>? retryPrimaryOnMiss;
+    private readonly StreamTraceBuffer? streamTrace;
+    private readonly ActiveReadRegistry? activeReadRegistry;
+    private readonly ArticleMissNegativeCache? articleMissCache;
+    private readonly ConnectionPoolStats? connectionPoolStats;
+    private readonly ConcurrentReadTracker? concurrentReadTracker;
+
+    public MultiProviderNntpClient(
+        List<MultiConnectionNntpClient> providers,
+        ProviderUsageTracker? usageTracker = null,
+        MetricsWriter? metricsWriter = null,
+        ProviderBytesTracker? bytesTracker = null,
+        Func<bool>? cascadeEnabled = null,
+        Func<bool>? retryPrimaryOnMiss = null,
+        StreamTraceBuffer? streamTrace = null,
+        ActiveReadRegistry? activeReadRegistry = null,
+        ArticleMissNegativeCache? articleMissCache = null,
+        ConnectionPoolStats? connectionPoolStats = null,
+        ConcurrentReadTracker? concurrentReadTracker = null,
+        TimeProvider? timeProvider = null)
+    {
+        this.providers = providers ?? throw new ArgumentNullException(nameof(providers));
+        _usageTracker = usageTracker ?? new ProviderUsageTracker();
+        this.metricsWriter = metricsWriter;
+        this.bytesTracker = bytesTracker;
+        this.cascadeEnabled = cascadeEnabled;
+        this.retryPrimaryOnMiss = retryPrimaryOnMiss;
+        this.streamTrace = streamTrace;
+        this.activeReadRegistry = activeReadRegistry;
+        this.articleMissCache = articleMissCache;
+        this.connectionPoolStats = connectionPoolStats;
+        this.concurrentReadTracker = concurrentReadTracker;
+        HealthAdmissionGeneration = new HealthCheckProviderGeneration(
+            this,
+            providers);
+    }
 
     /// <summary>
     /// Max concurrent batch-failover BODY starts. Admission stays strictly ordered;
@@ -47,7 +75,9 @@ public class MultiProviderNntpClient(
     /// </summary>
     private const int MaxConcurrentFallbackStarts = 4;
     private readonly SemaphoreSlim _batchFallbackStartGate = new(MaxConcurrentFallbackStarts);
-    public int InFlightConnections => providers.Sum(p => p.InFlightConnections);
+    internal HealthCheckProviderGeneration HealthAdmissionGeneration { get; }
+    public int InFlightConnections =>
+        providers.Sum(p => p.InFlightConnections) + HealthAdmissionGeneration.ActivePins;
 
     /// <summary>
     /// Applies Streaming Priority odds to every provider's connection gate so a settings
@@ -84,7 +114,11 @@ public class MultiProviderNntpClient(
                 p.PendingSelections,
                 p.GetConnectionChurn(),
                 p.LearnedConnectionLimit,
-                p.EffectiveMaxConnections))
+                p.MaxConnections,
+                p.EffectiveMaxConnections,
+                p.GetConnectionAdmissionSnapshot(),
+                p.EffectiveStatPipelineDepth,
+                p.ConfiguredPipeliningDepth))
             .ToList();
     }
 
@@ -133,7 +167,7 @@ public class MultiProviderNntpClient(
         }
     }
 
-    private readonly ProviderUsageTracker _usageTracker = usageTracker ?? new ProviderUsageTracker();
+    private readonly ProviderUsageTracker _usageTracker;
     private static readonly AsyncLocal<Guid?> ReadSessionScope = new();
     internal static Guid? CurrentReadSessionId => ReadSessionScope.Value;
 
@@ -379,7 +413,8 @@ public class MultiProviderNntpClient(
         async Task<UsenetDecodedBodyBatch> DecodedBodiesCoreAsync()
         {
             ExceptionDispatchInfo? lastException = null;
-            var orderedProviders = SelectOrderedProviders(out var reserved);
+            var orderedProviders = SelectOrderedProviders(
+                out var reserved, NntpOperation.PipelinedBody, cancellationToken);
             using var releasePending = new ScopeReleaser(() => reserved?.ReleasePending());
             for (var providerIndex = 0; providerIndex < orderedProviders.Count; providerIndex++)
             {
@@ -821,7 +856,7 @@ public class MultiProviderNntpClient(
         var lastOutcomeWasException = false;
         List<(string Host, SegmentFetch.FetchStatus Reason)>? priorMisses = null;
         var missingGroups = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var orderedProviders = SelectOrderedProviders(out var reserved);
+        var orderedProviders = SelectOrderedProviders(out var reserved, operation, cancellationToken);
         using var releasePending = new ScopeReleaser(() => reserved?.ReleasePending());
         var walk = new ProviderWalkSummary(orderedProviders.Count);
         MultiConnectionNntpClient? lastAttemptedProvider = null;
@@ -956,7 +991,7 @@ public class MultiProviderNntpClient(
         MultiConnectionNntpClient? lastAttemptedProvider = null;
         List<(string Host, SegmentFetch.FetchStatus Reason)>? priorMisses = null;
         var missingGroups = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var orderedProviders = SelectOrderedProviders(out var reserved);
+        var orderedProviders = SelectOrderedProviders(out var reserved, operation, cancellationToken);
         using var releasePending = new ScopeReleaser(() => reserved?.ReleasePending());
         var walk = new ProviderWalkSummary(orderedProviders.Count);
         var attemptIndex = 0;
@@ -1011,6 +1046,7 @@ public class MultiProviderNntpClient(
                     walk.CurrentDefinitiveMisses++;
                     RecordFetch(provider.MetricsKey, SegmentFetch.FetchStatus.Missing,
                         stopwatch.ElapsedMilliseconds, attemptIndex, traceRange);
+                    RecordStatAttempt(operation, provider.MetricsKey, "missing", stopwatch.Elapsed);
                     (priorMisses ??= new()).Add((provider.MetricsKey, SegmentFetch.FetchStatus.Missing));
                     lastNoArticleResult = result;
                     lastOutcomeWasException = false;
@@ -1044,7 +1080,10 @@ public class MultiProviderNntpClient(
                         stopwatch.ElapsedMilliseconds, attemptIndex, traceRange);
                 }
                 // STAT/HEAD/DATE successes: intentionally no SegmentFetch row (not a segment transfer;
-                // matches StatsPipelinedAsync which records nothing).
+                // matches StatsPipelinedAsync which records nothing). The stat_* families cover
+                // verification without altering that contract.
+                RecordStatAttempt(operation, provider.MetricsKey, "exists", stopwatch.Elapsed);
+                RecordStatWalk(operation, walk, "exists");
 
                 return result;
             }
@@ -1058,6 +1097,7 @@ public class MultiProviderNntpClient(
                 stopwatch.Stop();
                 walk.NoteException(e);
                 MarkCachedMissingOnThrownMiss(e, articleId, provider, missingGroups);
+                RecordStatAttempt(operation, provider.MetricsKey, "error", stopwatch.Elapsed);
                 var reason = ClassifyAndRecordFailure(
                     provider.MetricsKey, e, stopwatch.ElapsedMilliseconds, attemptIndex,
                     traceRange, operation, articleId);
@@ -1074,6 +1114,7 @@ public class MultiProviderNntpClient(
         walk.LastOutcomeWasException = lastOutcomeWasException;
         LogProviderWalkOutcome(
             walk, articleId, operation, lastAttemptedProvider?.Host, lastException?.SourceException);
+        RecordStatWalk(operation, walk, lastOutcomeWasException ? "error" : "missing");
         if (lastOutcomeWasException)
             lastException!.Throw();
         if (lastNoArticleResult is not null) return lastNoArticleResult;
@@ -1485,7 +1526,228 @@ public class MultiProviderNntpClient(
 
     private static string NormalizeStorageGroup(string? value) => value?.Trim() ?? "";
 
-    private List<MultiConnectionNntpClient> SelectOrderedProviders(out MultiConnectionNntpClient? reserved)
+    /// <summary>
+    /// STAT is the verification primitive: background health checks and queue article
+    /// validation resolve every segment through it. The SegmentFetch families describe
+    /// transfers and deliberately record nothing for a successful STAT, so walk depth and
+    /// first-provider hit rate previously had to be inferred from miss counts alone. These
+    /// record verification directly, leaving the SegmentFetch contract untouched.
+    /// </summary>
+    private static bool IsVerificationOperation(NntpOperation operation) =>
+        operation is NntpOperation.Stat or NntpOperation.PipelinedStat;
+
+    private void RecordStatAttempt(
+        NntpOperation operation,
+        string providerKey,
+        string result,
+        TimeSpan elapsed)
+    {
+        if (!IsVerificationOperation(operation)) return;
+        PrometheusMetrics.Current?.RecordStatAttempt(providerKey, result, elapsed);
+    }
+
+    private static void RecordStatWalk(
+        NntpOperation operation,
+        ProviderWalkSummary walk,
+        string outcome)
+    {
+        if (!IsVerificationOperation(operation)) return;
+        PrometheusMetrics.Current?.RecordStatWalk(outcome, walk.Attempts);
+    }
+
+    /// <summary>
+    /// Ordered providers for a verification sweep, one entry per distinct storage group.
+    /// Snapshot this once per file and sweep the entries in order, passing each phase's
+    /// unresolved ids into the next; whatever survives the last entry is missing everywhere.
+    /// </summary>
+    public IReadOnlyList<VerificationProvider> GetVerificationProviderOrder(
+        CancellationToken cancellationToken)
+    {
+        var seenGroups = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var order = new List<VerificationProvider>();
+        foreach (var provider in OrderProviders(NntpOperation.PipelinedStat, cancellationToken))
+        {
+            // OrderProviders falls back to open circuits when every provider is unavailable
+            // so foreground transfers can still attempt recovery. A health sweep must not
+            // schedule those providers as completed verification work without issuing STAT.
+            if (IsOverLimit(provider)
+                || provider.GetCircuitBreakerSnapshot().State == ProviderCircuitState.Open)
+            {
+                continue;
+            }
+
+            var group = NormalizeStorageGroup(provider.StorageGroup);
+            // Siblings share upstream storage, so probing more than one is a guaranteed
+            // repeat of the same answer — the per-STAT walk skips them for the same reason.
+            if (group.Length > 0 && !seenGroups.Add(group)) continue;
+            order.Add(new VerificationProvider(provider.MetricsKey, provider.Host, group));
+        }
+
+        return order;
+    }
+
+    /// <summary>
+    /// Sweeps one provider for <paramref name="segmentIds"/> over a single pipelined
+    /// connection and returns its definitive misses and unanswered ids separately, in
+    /// input order.
+    ///
+    /// Deliberately performs no failover: the caller owns the walk, so one sweep consumes
+    /// exactly one connection and stays inside whatever admission it was granted. That is
+    /// the accounting property a chunked sweep with internal fan-out cannot offer.
+    ///
+    /// A provider that errors or disappears mid-batch passes its remaining work to the next
+    /// phase as unanswered. The distinction matters at the end of the provider walk: only
+    /// ids that every provider definitively missed may become confirmed holes.
+    /// Progress counts source positions rather than unique ids so scheduler accounting stays
+    /// truthful when a chunk contains duplicate message ids or cached misses.
+    /// </summary>
+    public async Task<ProviderVerificationSweepResult> SweepProviderPipelinedAsync(
+        string providerKey,
+        IReadOnlyList<string> segmentIds,
+        int depth,
+        IProgress<int>? progress,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(segmentIds);
+        if (segmentIds.Count == 0) return new([], []);
+
+        // A message-id is one logical article even when malformed or fallback metadata
+        // references it more than once. Probe it once, then let the scheduler project the
+        // verdict back onto every occurrence in the source segment list.
+        var uniqueSegmentIds = segmentIds
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+        var occurrenceCounts = segmentIds
+            .GroupBy(segmentId => segmentId, StringComparer.Ordinal)
+            .ToDictionary(group => group.Key, group => group.Count(), StringComparer.Ordinal);
+        var processed = 0;
+
+        void ReportProcessed(string segmentId)
+        {
+            if (!occurrenceCounts.TryGetValue(segmentId, out var occurrences)) return;
+            processed += occurrences;
+            progress?.Report(Math.Min(processed, segmentIds.Count));
+        }
+
+        void ReportCompletion()
+        {
+            if (processed >= segmentIds.Count) return;
+            processed = segmentIds.Count;
+            progress?.Report(processed);
+        }
+
+        var provider = providers.FirstOrDefault(p =>
+            string.Equals(p.MetricsKey, providerKey, StringComparison.Ordinal));
+        if (provider is null
+            || provider.ProviderType == ProviderType.Disabled
+            || IsOverLimit(provider)
+            || provider.GetCircuitBreakerSnapshot().State == ProviderCircuitState.Open)
+        {
+            ReportCompletion();
+            return new ProviderVerificationSweepResult([], uniqueSegmentIds);
+        }
+
+        var missing = new HashSet<string>(StringComparer.Ordinal);
+        var unanswered = new HashSet<string>(StringComparer.Ordinal);
+        var toProbe = new List<string>(uniqueSegmentIds.Length);
+        foreach (var segmentId in uniqueSegmentIds)
+        {
+            // Already known missing here from an earlier file or run; re-asking cannot change
+            // the answer and would spend a round trip to learn nothing.
+            if (IsCachedMissing(new SegmentId(segmentId), provider))
+            {
+                missing.Add(segmentId);
+                ReportProcessed(segmentId);
+            }
+            else
+                toProbe.Add(segmentId);
+        }
+
+        if (toProbe.Count == 0)
+            return new(uniqueSegmentIds.Where(missing.Contains).ToArray(), []);
+
+        var answered = new HashSet<string>(StringComparer.Ordinal);
+        try
+        {
+            var lastResultAt = Stopwatch.GetTimestamp();
+            await foreach (var result in provider
+                               .StatsPipelinedAsync(toProbe, depth, cancellationToken)
+                               .WithCancellation(cancellationToken)
+                               .ConfigureAwait(false))
+            {
+                var now = Stopwatch.GetTimestamp();
+                var elapsed = Stopwatch.GetElapsedTime(lastResultAt, now);
+                lastResultAt = now;
+                var isFirstAnswer = answered.Add(result.SegmentId);
+
+                var statResult = result.Exists
+                    ? "exists"
+                    : result.DefinitivelyMissing ? "missing" : "error";
+                PrometheusMetrics.Current?.RecordStatAttempt(
+                    provider.MetricsKey, statResult, elapsed);
+
+                if (result.Exists) continue;
+                if (result.DefinitivelyMissing)
+                {
+                    missing.Add(result.SegmentId);
+                    MarkCachedMissing(new SegmentId(result.SegmentId), provider);
+                }
+                else
+                {
+                    unanswered.Add(result.SegmentId);
+                }
+
+                if (isFirstAnswer)
+                    ReportProcessed(result.SegmentId);
+            }
+        }
+        catch (Exception e) when (!e.IsCancellationException(cancellationToken)
+                                  && e is not OutOfMemoryException)
+        {
+            // The connection died or the provider misbehaved partway through. The ids it
+            // never answered flow to the next provider rather than failing the file; the
+            // breaker was already told inside the pipelined run.
+            Log.Debug(
+                e,
+                "Pipelined verification sweep on {Host} ended after {Answered}/{Total} segments; " +
+                "deferring the remainder to the next provider",
+                provider.Host,
+                answered.Count,
+                toProbe.Count);
+        }
+
+        foreach (var segmentId in toProbe)
+            if (!answered.Contains(segmentId))
+                unanswered.Add(segmentId);
+
+        ReportCompletion();
+
+        // Results classify logical ids once and retain their first-seen input order. The
+        // scheduler expands each classification to every matching source position.
+        return new ProviderVerificationSweepResult(
+            uniqueSegmentIds.Where(missing.Contains).ToArray(),
+            uniqueSegmentIds.Where(unanswered.Contains).ToArray());
+    }
+
+    private List<MultiConnectionNntpClient> SelectOrderedProviders(
+        out MultiConnectionNntpClient? reserved,
+        NntpOperation operation,
+        CancellationToken cancellationToken)
+    {
+        var ordered = OrderProviders(operation, cancellationToken);
+        reserved = ordered.Count > 0 ? ordered[0] : null;
+        reserved?.ReservePending();
+        return ordered;
+    }
+
+    /// <summary>
+    /// Ordering without claiming a pending reservation, so a caller can snapshot the walk
+    /// order (see <see cref="GetVerificationProviderOrder"/>) without holding a slot it may
+    /// never dispatch.
+    /// </summary>
+    private List<MultiConnectionNntpClient> OrderProviders(
+        NntpOperation operation,
+        CancellationToken cancellationToken)
     {
         lock (_selectLock)
         {
@@ -1526,13 +1788,9 @@ public class MultiProviderNntpClient(
             var capacityBalanced = cascade
                 ? byUsage.ThenByDescending(x => x.SpareFraction)
                 : byUsage.ThenByDescending(x => x.UnreservedConnections);
-            var ordered = capacityBalanced
+            return capacityBalanced
                 .ThenBy(EstimatedDeliveryScore)
                 .ToList();
-
-            reserved = ordered.Count > 0 ? ordered[0] : null;
-            reserved?.ReservePending();
-            return ordered;
         }
     }
 
@@ -1562,6 +1820,11 @@ public class MultiProviderNntpClient(
         var bytesPerMs = bytesTracker?.GetBytesPerMs(provider.MetricsKey) ?? 0d;
         return bytesPerMs > 0 ? inFlight / bytesPerMs : inFlight;
     }
+
+    internal bool IsProviderAvailableForHealthAdmission(MultiConnectionNntpClient provider) =>
+        provider.ProviderType != ProviderType.Disabled
+        && !IsOverLimit(provider)
+        && provider.GetCircuitBreakerSnapshot().State != ProviderCircuitState.Open;
 
     private bool IsOverLimit(MultiConnectionNntpClient client)
     {
@@ -1595,7 +1858,8 @@ public class MultiProviderNntpClient(
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         if (segmentIds.Count == 0) yield break;
-        var orderedProviders = SelectOrderedProviders(out var reserved);
+        var orderedProviders = SelectOrderedProviders(
+            out var reserved, NntpOperation.PipelinedStat, cancellationToken);
         using var releasePending = new ScopeReleaser(() => reserved?.ReleasePending());
         var primary = orderedProviders.Count > 0 ? orderedProviders[0] : null;
         if (primary == null) yield break;
@@ -1619,7 +1883,8 @@ public class MultiProviderNntpClient(
         // already records metrics / wraps streams for byte counting.
         int effectiveDepth;
         {
-            var orderedProviders = SelectOrderedProviders(out var reserved);
+            var orderedProviders = SelectOrderedProviders(
+                out var reserved, NntpOperation.PipelinedBody, cancellationToken);
             using var releasePending = new ScopeReleaser(() => reserved?.ReleasePending());
             var primary = orderedProviders.Count > 0 ? orderedProviders[0] : null;
             if (primary == null) yield break;
@@ -1650,11 +1915,16 @@ public class MultiProviderNntpClient(
     public override void Dispose()
     {
         connectionPoolStats?.Deactivate();
+        HealthAdmissionGeneration.Close();
         foreach (var provider in providers)
             provider.Dispose();
         _batchFallbackStartGate.Dispose();
         GC.SuppressFinalize(this);
     }
 
-    internal override void Retire() => connectionPoolStats?.Deactivate();
+    internal override void Retire()
+    {
+        connectionPoolStats?.Deactivate();
+        HealthAdmissionGeneration.Retire();
+    }
 }

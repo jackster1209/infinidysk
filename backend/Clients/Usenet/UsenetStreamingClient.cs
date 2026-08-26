@@ -1,6 +1,7 @@
 ﻿using System.Text.Json;
 using NzbWebDAV.Clients.Usenet.Concurrency;
 using NzbWebDAV.Clients.Usenet.Connections;
+using NzbWebDAV.Clients.Usenet.Contexts;
 using NzbWebDAV.Clients.Usenet.Models;
 using NzbWebDAV.Config;
 using NzbWebDAV.Database.Models.Metrics;
@@ -21,6 +22,9 @@ public class UsenetStreamingClient : WrappingNntpClient
 {
     private readonly Lock _configChangeLock = new();
     private readonly RepairPatchStore? _repairPatchStore;
+    private readonly HealthCheckProviderAdmissionRegistry _healthProviderAdmissions;
+    private readonly bool _ownsHealthProviderAdmissions;
+    private int _disposed;
 
     public UsenetStreamingClient(
         ConfigManager configManager,
@@ -33,7 +37,8 @@ public class UsenetStreamingClient : WrappingNntpClient
         ArticleMissNegativeCache? articleMissCache = null,
         ProviderLatencyTracker? latencyTracker = null,
         ConcurrentReadTracker? concurrentReadTracker = null,
-        RepairPatchStore? repairPatchStore = null)
+        RepairPatchStore? repairPatchStore = null,
+        HealthCheckProviderAdmissionRegistry? healthProviderAdmissions = null)
 #pragma warning disable CA2000 // the client chain transfers to the base class and is disposed with this instance
         : base(CreateDownloadingNntpClient(
 #pragma warning restore CA2000
@@ -42,6 +47,10 @@ public class UsenetStreamingClient : WrappingNntpClient
             repairPatchStore))
     {
         _repairPatchStore = repairPatchStore;
+        _healthProviderAdmissions = healthProviderAdmissions
+            ?? new HealthCheckProviderAdmissionRegistry();
+        _ownsHealthProviderAdmissions = healthProviderAdmissions is null;
+        ActivateCurrentHealthAdmissionGeneration();
         // when config changes, create a new MultiProviderClient to use instead.
         configManager.OnConfigChanged += (_, configEventArgs) =>
         {
@@ -61,10 +70,28 @@ public class UsenetStreamingClient : WrappingNntpClient
                         // update the connection-pool according to the new config. New pools are
                         // built with the current odds, so a save that changes both needs no
                         // separate update (and must not touch the retired client).
+#pragma warning disable CA2000 // transferred to the wrapper on replacement; disposed below if publication fails
                         var newUsenetClient = CreateDownloadingNntpClient(
+#pragma warning restore CA2000
                             configManager, websocketManager, usageTracker, metricsWriter, bytesTracker,
                             streamTrace, activeReadRegistry, articleMissCache, latencyTracker,
                             concurrentReadTracker, _repairPatchStore);
+                        try
+                        {
+                            var newMulti = WrappingNntpClient.Unwrap(newUsenetClient)
+                                as MultiProviderNntpClient
+                                ?? throw new InvalidOperationException(
+                                    "The rebuilt Usenet client did not contain a multi-provider client.");
+                            // Publish the new generation before retiring the old chain. Any lease
+                            // already acquired from the old generation pins its retirement; new
+                            // acquisitions bind directly to the replacement generation.
+                            _healthProviderAdmissions.Activate(newMulti.HealthAdmissionGeneration);
+                        }
+                        catch (Exception e) when (e is not OutOfMemoryException)
+                        {
+                            newUsenetClient.Dispose();
+                            throw;
+                        }
                         ReplaceUnderlyingClient(newUsenetClient);
                         return;
                     }
@@ -87,10 +114,26 @@ public class UsenetStreamingClient : WrappingNntpClient
     /// Test constructor that wraps a scripted <see cref="INntpClient"/> without
     /// opening real provider pools.
     /// </summary>
-    internal UsenetStreamingClient(INntpClient inner, RepairPatchStore? repairPatchStore = null)
+    internal UsenetStreamingClient(
+        INntpClient inner,
+        RepairPatchStore? repairPatchStore = null,
+        HealthCheckProviderAdmissionRegistry? healthProviderAdmissions = null)
         : base(inner)
     {
         _repairPatchStore = repairPatchStore;
+        _healthProviderAdmissions = healthProviderAdmissions
+            ?? new HealthCheckProviderAdmissionRegistry();
+        _ownsHealthProviderAdmissions = healthProviderAdmissions is null;
+        ActivateCurrentHealthAdmissionGeneration();
+    }
+
+    internal HealthCheckProviderAdmissionRegistry HealthProviderAdmissions =>
+        _healthProviderAdmissions;
+
+    private void ActivateCurrentHealthAdmissionGeneration()
+    {
+        if (WrappingNntpClient.Unwrap(InnerClient) is MultiProviderNntpClient multi)
+            _healthProviderAdmissions.Activate(multi.HealthAdmissionGeneration);
     }
 
     private static HeaderCachingNntpClient CreateDownloadingNntpClient
@@ -170,11 +213,70 @@ public class UsenetStreamingClient : WrappingNntpClient
             : Array.Empty<ProviderConnectionSnapshot>();
     }
 
+    public bool SupportsProviderVerificationSweeps =>
+        WrappingNntpClient.Unwrap(InnerClient) is MultiProviderNntpClient;
+
+    /// <summary>
+    /// Ordered providers for a verification sweep, one entry per storage group. Snapshot
+    /// once per file; sweeping is one provider per phase so each phase is one connection.
+    /// </summary>
+    public IReadOnlyList<VerificationProvider> GetVerificationProviderOrder(
+        CancellationToken cancellationToken)
+    {
+        return WrappingNntpClient.Unwrap(InnerClient) is MultiProviderNntpClient multi
+            ? multi.GetVerificationProviderOrder(cancellationToken)
+            : Array.Empty<VerificationProvider>();
+    }
+
+    /// <summary>
+    /// Sweeps one provider over a single pipelined connection, returning definitive misses
+    /// separately from ids the provider did not answer. Performs no failover; the caller
+    /// owns the walk.
+    /// </summary>
+    public Task<ProviderVerificationSweepResult> SweepProviderPipelinedAsync(
+        string providerKey,
+        IReadOnlyList<string> segmentIds,
+        int depth,
+        IProgress<int>? progress,
+        CancellationToken cancellationToken)
+    {
+        if (cancellationToken.GetContext<HealthCheckAdmissionContext>() is
+            ProviderAwareHealthCheckAdmissionContext { ProviderLease: { } providerLease }
+            && string.Equals(providerLease.ProviderKey, providerKey, StringComparison.Ordinal))
+        {
+            return providerLease.SweepProviderPipelinedAsync(
+                segmentIds,
+                depth,
+                progress,
+                cancellationToken);
+        }
+
+        if (WrappingNntpClient.Unwrap(InnerClient) is MultiProviderNntpClient multi)
+        {
+            return multi.SweepProviderPipelinedAsync(
+                providerKey, segmentIds, depth, progress, cancellationToken);
+        }
+
+        progress?.Report(segmentIds.Count);
+        return Task.FromResult(ProviderVerificationSweepResult.AllUnanswered(segmentIds));
+    }
+
     public Task ProbeLatchedProvidersAsync(CancellationToken cancellationToken)
     {
         return WrappingNntpClient.Unwrap(InnerClient) is MultiProviderNntpClient multi
             ? multi.ProbeLatchedProvidersAsync(cancellationToken)
             : Task.CompletedTask;
+    }
+
+    public override void Dispose()
+    {
+        if (Interlocked.Exchange(ref _disposed, 1) == 1) return;
+        if (WrappingNntpClient.Unwrap(InnerClient) is MultiProviderNntpClient multi)
+            _healthProviderAdmissions.Deactivate(multi.HealthAdmissionGeneration.GenerationId);
+        base.Dispose();
+        if (_ownsHealthProviderAdmissions)
+            _healthProviderAdmissions.Dispose();
+        GC.SuppressFinalize(this);
     }
 
     private static MultiProviderNntpClient CreateMultiProviderClient
@@ -207,6 +309,7 @@ public class UsenetStreamingClient : WrappingNntpClient
             .Select((provider, index) => CreateProviderClient(
                 provider,
                 connectionPoolStats.GetOnConnectionPoolChanged(index),
+                connectionPoolStats.GetOnConnectionAdmissionChanged(index),
                 idleTimeoutSeconds,
                 configManager.IsWarmConnectionsEnabled()
                     ? configManager.GetWarmConnectionsFloor(provider.MaxConnections)
@@ -221,6 +324,7 @@ public class UsenetStreamingClient : WrappingNntpClient
             providerClients, usageTracker, metricsWriter, bytesTracker,
             cascadeEnabled: configManager.IsCascadeEnabled,
             retryPrimaryOnMiss: configManager.IsCascadeRetryPrimaryOnMiss,
+            verificationRoutingEnabled: configManager.IsVerificationRoutingEnabled,
             streamTrace: streamTrace,
             activeReadRegistry: activeReadRegistry,
             articleMissCache: articleMissCache,
@@ -232,6 +336,7 @@ public class UsenetStreamingClient : WrappingNntpClient
     (
         UsenetProviderConfig.ConnectionDetails connectionDetails,
         EventHandler<ConnectionPoolStats.ConnectionPoolChangedEventArgs> onConnectionPoolChanged,
+        Action<ProviderConnectionAdmissionSnapshot> onConnectionAdmissionChanged,
         int idleTimeoutSeconds,
         int warmConnectionFloor,
         MetricsWriter metricsWriter,
@@ -339,7 +444,10 @@ public class UsenetStreamingClient : WrappingNntpClient
             connectionDetails.PipeliningDepth,
             connectionDetails.StorageGroup,
             metricsKey,
-            latencyTracker
+            latencyTracker,
+            connectionDetails.MaxTransferConnections,
+            streamingPriority,
+            onConnectionAdmissionChanged
         );
     }
 

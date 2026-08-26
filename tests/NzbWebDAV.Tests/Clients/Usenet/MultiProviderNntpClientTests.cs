@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using System.IO;
 using NzbWebDAV.Clients.Usenet;
 using NzbWebDAV.Clients.Usenet.Connections;
@@ -2177,7 +2178,9 @@ public class MultiProviderNntpClientTests
         ProviderCircuitBreaker? circuitBreaker = null,
         ProviderType providerType = ProviderType.Pooled,
         int maxConnections = 1,
-        int priority = 0)
+        int priority = 0,
+        long? byteLimit = null,
+        long bytesUsedOffset = 0)
     {
         var pool = new ConnectionPool<INntpClient>(
             maxConnections, _ => ValueTask.FromResult(connection));
@@ -2186,6 +2189,8 @@ public class MultiProviderNntpClientTests
             providerType,
             circuitBreaker ?? new ProviderCircuitBreaker(host),
             host,
+            byteLimit: byteLimit,
+            bytesUsedOffset: bytesUsedOffset,
             priority: priority,
             storageGroup: storageGroup);
     }
@@ -2221,6 +2226,18 @@ public class MultiProviderNntpClientTests
         public bool DeferSingularCompletion { get; init; }
         public int BatchRequests { get; private set; }
         public int SingularRequests { get; private set; }
+
+        /// <summary>
+        /// Segment ids this provider holds, for pipelined STAT sweeps. When null the base
+        /// per-segment fallback applies, matching the previous behaviour of this harness.
+        /// </summary>
+        public HashSet<string>? PipelinedStatHolds { get; init; }
+
+        /// <summary>Throws after emitting this many pipelined results, to model a batch that dies partway.</summary>
+        public int? PipelinedStatThrowAfter { get; init; }
+
+        /// <summary>Pipelined STAT batches issued — one per sweep, never per segment.</summary>
+        public int BatchStatRequests { get; private set; }
         private readonly Queue<ArticleBodyCompletionHandler> _pendingSingularCallbacks = new();
 
         public override Task<UsenetDecodedBodyBatch> DecodedBodiesAsync(
@@ -2314,6 +2331,37 @@ public class MultiProviderNntpClientTests
                 ResponseMessage = $"{SingularResponseCode} scripted stat <{segmentId}>",
                 ArticleExists = SingularResponseCode == (int)UsenetResponseType.ArticleExists,
             });
+        }
+
+        public override async IAsyncEnumerable<PipelinedStatResult> StatsPipelinedAsync(
+            IReadOnlyList<string> segmentIds,
+            int depth,
+            [EnumeratorCancellation] CancellationToken cancellationToken)
+        {
+            if (PipelinedStatHolds is null)
+            {
+                await foreach (var result in base
+                                   .StatsPipelinedAsync(segmentIds, depth, cancellationToken)
+                                   .WithCancellation(cancellationToken))
+                    yield return result;
+                yield break;
+            }
+
+            BatchStatRequests++;
+            await Task.Yield();
+            var emitted = 0;
+            foreach (var segmentId in segmentIds)
+            {
+                if (PipelinedStatThrowAfter is { } limit && emitted == limit)
+                    throw new InvalidOperationException("connection died mid-batch");
+                emitted++;
+                yield return new PipelinedStatResult
+                {
+                    SegmentId = segmentId,
+                    Exists = PipelinedStatHolds.Contains(segmentId),
+                    DefinitivelyMissing = !PipelinedStatHolds.Contains(segmentId),
+                };
+            }
         }
 
         public override Task<UsenetHeadResponse> HeadAsync(

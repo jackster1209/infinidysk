@@ -33,8 +33,13 @@ public class BaseNntpClient : NntpClient
     }
 
 #pragma warning disable CA2000 // the client is stored in _client and disposed with this instance
-    public BaseNntpClient(bool skipTlsVerification) : this(new UsenetClient(new UsenetClientOptions
+    public BaseNntpClient(bool skipTlsVerification)
+        : this(new UsenetClient(CreateOptions(skipTlsVerification)))
 #pragma warning restore CA2000
+    {
+    }
+
+    private static UsenetClientOptions CreateOptions(bool skipTlsVerification) => new()
     {
         CrcValidation = EnvironmentUtil.GetEnvironmentVariable("USENET_DISABLE_CRC_VALIDATION") == "1"
             ? YencCrcValidationMode.Off
@@ -42,9 +47,20 @@ public class BaseNntpClient : NntpClient
         SkipTlsVerification = skipTlsVerification,
         DecodedBodyBufferedBytesObserver = static delta =>
             InFlightArticleBudget.Current?.AccountBufferedPipeBytes(delta),
-    }))
-    {
-    }
+    };
+
+    /// <summary>
+    /// The UsenetSharp <see cref="UsenetClientOptions.MaxPipelineDepth"/> every physical
+    /// connection is constructed with, which is the window STAT actually runs at.
+    /// <para>
+    /// This is deliberately independent of a provider's configured
+    /// <c>PipeliningDepth</c>: that setting is BODY/queue-oriented and
+    /// <see cref="StatsPipelinedAsync"/> ignores its <c>depth</c> argument entirely.
+    /// Read from the same options factory the pool uses so the two cannot drift.
+    /// </para>
+    /// </summary>
+    internal static int EffectiveStatPipelineDepth { get; } =
+        CreateOptions(skipTlsVerification: false).MaxPipelineDepth;
 
     /// <summary>Test seam for injecting a scripted underlying client.</summary>
     internal BaseNntpClient(IUsenetClient client)
@@ -145,6 +161,7 @@ public class BaseNntpClient : NntpClient
                     {
                         SegmentId = segmentId,
                         Exists = true,
+                        DefinitivelyMissing = false,
                     };
                     continue;
                 }
@@ -155,6 +172,7 @@ public class BaseNntpClient : NntpClient
                     {
                         SegmentId = segmentId,
                         Exists = false,
+                        DefinitivelyMissing = true,
                     };
                     continue;
                 }

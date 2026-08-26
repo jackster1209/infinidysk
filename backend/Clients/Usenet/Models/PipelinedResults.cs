@@ -36,4 +36,11 @@ public sealed record PipelinedStatResult
 {
     public required string SegmentId { get; init; }
     public required bool Exists { get; init; }
+
+    /// <summary>
+    /// True only when the provider returned a definitive missing response (430/451).
+    /// False for successful responses and connection/session-level failures that must
+    /// remain eligible for another provider rather than becoming confirmed holes.
+    /// </summary>
+    public bool DefinitivelyMissing { get; init; }
 }
