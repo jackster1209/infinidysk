@@ -581,14 +581,12 @@ public class HealthCheckService : BackgroundService
             using (statCts = ContextualCancellationTokenSource.CreateLinkedTokenSource(ct))
             {
                 statCts.CancelAfter(HealthCheckProgressTimeout);
-                var progress = new SynchronousProgress<int>(completed =>
-                    progressHook.Report((int)((long)completed * 100 / statSegments.Count)));
 
                 // Each scheduler assignment remains provider-local and uses one connection;
                 // completed chunks stream their unresolved ids into the next provider session.
                 // Whatever survives the final provider is missing everywhere.
                 var unresolved = await SweepProvidersAsync(
-                        runId, davItem.Id, statSegments, progress, statCts)
+                        runId, davItem.Id, statSegments, progressHook, statCts)
                     .ConfigureAwait(false);
 
                 if (!canClassify)
@@ -996,6 +994,23 @@ public class HealthCheckService : BackgroundService
         int basePhaseId = 0)
     {
         if (segmentIds.Count == 0) return [];
+        var logicalSegmentIds = segmentIds
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+        var total = logicalSegmentIds.Length;
+        var percentageProgress = progress is null
+            ? null
+            : new SynchronousProgress<int>(terminal =>
+                progress.Report((int)((long)terminal * 100 / total)));
+        var sweepProgress = new LogicalSweepProgress(percentageProgress, total, () =>
+        {
+            try { statCts.CancelAfter(HealthCheckProgressTimeout); }
+            catch (ObjectDisposedException)
+            {
+                // racing teardown; the sweep is ending anyway
+            }
+        });
+        sweepProgress.Start();
 
         IReadOnlyList<VerificationProvider> order;
         // Ordering is verification-aware only when the admission context is on the token;
@@ -1011,7 +1026,7 @@ public class HealthCheckService : BackgroundService
             if (_usenetClient.SupportsProviderVerificationSweeps)
             {
                 throw new UsenetUnexpectedResponseException(
-                    segmentIds[0],
+                    logicalSegmentIds[0],
                     "no provider was available for verification");
             }
 
@@ -1024,28 +1039,18 @@ public class HealthCheckService : BackgroundService
                     davItemId,
                     basePhaseId,
                     providerKey: null,
-                    segmentIds,
+                    logicalSegmentIds,
                     async (chunk, chunkProgress, chunkCt) => new HealthCheckStatChunkResult(
                         await _usenetClient.CollectMissingSegmentsPipelinedAsync(
                                 chunk, depth: 0, fallbackConcurrency: 1, chunkProgress, chunkCt)
                             .ConfigureAwait(false),
                         []),
-                    progress,
+                    sweepProgress.Activity,
                     statCts)
                 .ConfigureAwait(false);
+            sweepProgress.AdvanceTerminal(total);
             return fallbackResult.Missing;
         }
-
-        var total = segmentIds.Count;
-        var sweepProgress = new LogicalSweepProgress(progress, total, () =>
-        {
-            try { statCts.CancelAfter(HealthCheckProgressTimeout); }
-            catch (ObjectDisposedException)
-            {
-                // racing teardown; the sweep is ending anyway
-            }
-        });
-        sweepProgress.Start();
 
         using var sweepCts = ContextualCancellationTokenSource.CreateLinkedTokenSource(
             statCts.Token);
@@ -1108,7 +1113,7 @@ public class HealthCheckService : BackgroundService
 
         try
         {
-            await sessions[0].AppendAsync(segmentIds).ConfigureAwait(false);
+            await sessions[0].AppendAsync(logicalSegmentIds).ConfigureAwait(false);
             await sessions[0].CompleteInputAsync().ConfigureAwait(false);
             for (var phase = 0; phase < sessions.Length; phase++)
             {
@@ -1142,7 +1147,7 @@ public class HealthCheckService : BackgroundService
             throw;
         }
 
-        var remaining = segmentIds.Where(finalUnresolved.Contains).ToArray();
+        var remaining = logicalSegmentIds.Where(finalUnresolved.Contains).ToArray();
         if (indeterminate.Count > 0)
         {
             var segmentId = remaining.FirstOrDefault(indeterminate.Contains);

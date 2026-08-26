@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Collections.Concurrent;
 using System.Text;
 using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
@@ -278,8 +279,15 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         fallbackIds[3] = [sharedFallback];
         var (item, oldBlobId) = await AddVideoFileAsync(
             "movie.mkv", segments, sizes, fallbackIds: fallbackIds);
+        var requested = new ConcurrentBag<string>();
         var provider = ScriptedProvider(
-            segments.Where((_, index) => index is not 2 and not 3).Append(sharedFallback).ToArray());
+            segments.Where((_, index) => index is not 2 and not 3).Append(sharedFallback).ToArray(),
+            beforePipelinedStatAsync: (batch, _) =>
+            {
+                foreach (var segmentId in batch)
+                    requested.Add(segmentId);
+                return Task.CompletedTask;
+            });
         var (service, par2) = await NewServiceAsync(ProviderWalk(provider), par2Outcome: false);
 
         await service.PerformHealthCheck(item, _dbClient, CancellationToken.None);
@@ -289,6 +297,35 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         Assert.Equal(HealthCheckResult.RepairAction.None, row.RepairStatus);
         Assert.Empty(par2.Requests);
         Assert.Equal(oldBlobId, ReloadItem(item.Id).FileBlobId);
+        Assert.Equal(1, requested.Count(segmentId => segmentId == sharedFallback));
+    }
+
+    [Fact]
+    public async Task RepeatedPrimaryId_VerifiesOnceAndProjectsMissingToEveryPosition()
+    {
+        var segments = NewSegmentIds(6);
+        segments[3] = segments[2];
+        var sizes = new long[] { 10_000, 10_000, 50, 50, 10_000, 10_000 };
+        var (item, _) = await AddVideoFileAsync("movie.mkv", segments, sizes);
+        var requested = new ConcurrentBag<string>();
+        var provider = ScriptedProvider(
+            segments.Where((_, index) => index is not 2 and not 3).ToArray(),
+            beforePipelinedStatAsync: (batch, _) =>
+            {
+                foreach (var segmentId in batch)
+                    requested.Add(segmentId);
+                return Task.CompletedTask;
+            });
+        var (service, _) = await NewServiceAsync(ProviderWalk(provider), par2Outcome: false);
+
+        await service.PerformHealthCheck(item, _dbClient, CancellationToken.None);
+
+        var row = Assert.Single(GetHealthRows(item.Id));
+        Assert.Equal(HealthCheckResult.HealthResult.Degraded, row.Result);
+        var persisted = ReloadItem(item.Id);
+        var blob = await BlobStore.ReadBlob<DavNzbFile>(persisted.FileBlobId!.Value);
+        Assert.Equal([2, 3], blob!.MissingSegmentIndices);
+        Assert.Equal(1, requested.Count(segmentId => segmentId == segments[2]));
     }
 
     [Fact]
@@ -1088,12 +1125,14 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
 
     private static MultiProviderNntpClientTests.ScriptedNntpClient ScriptedProvider(
         IReadOnlyCollection<string> holds,
-        int? throwAfter = null) => new()
+        int? throwAfter = null,
+        Func<IReadOnlyList<string>, CancellationToken, Task>? beforePipelinedStatAsync = null) => new()
         {
             BatchResponseCode = 430,
             SingularResponseCode = (int)UsenetResponseType.NoArticleWithThatMessageId,
             PipelinedStatHolds = holds.ToHashSet(StringComparer.Ordinal),
             PipelinedStatThrowAfter = throwAfter,
+            BeforePipelinedStatAsync = beforePipelinedStatAsync,
         };
 
     private static MultiProviderNntpClient ProviderWalk(
