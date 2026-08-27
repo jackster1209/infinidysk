@@ -9,6 +9,7 @@ using NzbWebDAV.Clients.Usenet.Models;
 using NzbWebDAV.Exceptions;
 using NzbWebDAV.Extensions;
 using NzbWebDAV.Models;
+using NzbWebDAV.Services;
 using NzbWebDAV.Services.Metrics;
 using NzbWebDAV.Services.StreamTrace;
 using Serilog;
@@ -836,7 +837,13 @@ public class MultiConnectionNntpClient(
 
     private static SemaphorePriority GetDownloadPriority(CancellationToken ct)
     {
-        return ct.GetContext<DownloadPriorityContext>()?.Priority ?? SemaphorePriority.Low;
+        if (ct.GetContext<DownloadPriorityContext>() is { } downloadPriority)
+            return downloadPriority.Priority;
+
+        return ct.GetContext<HealthCheckAdmissionContext>()?.Priority
+            == HealthCheckAdmissionPriority.Queue
+                ? SemaphorePriority.High
+                : SemaphorePriority.Low;
     }
 
     /// <summary>
@@ -853,6 +860,13 @@ public class MultiConnectionNntpClient(
         var traceRange = MultiProviderNntpClient.CurrentStreamTraceRange;
         var started = Stopwatch.GetTimestamp();
         ConnectionLock<INntpClient> connectionLock;
+        HealthCheckConnectionGate.Lease? healthCheckLease = null;
+        try
+        {
+            if (ct.GetContext<HealthCheckAdmissionContext>() is { } healthCheckContext)
+            {
+                healthCheckLease = await healthCheckContext.Gate
+                    .AcquireAsync(healthCheckContext.Priority, ct)
         ProviderConnectionAdmission.Lease? admissionLease = null;
         try
         {
@@ -865,6 +879,11 @@ public class MultiConnectionNntpClient(
 
             connectionLock = await connectionPool.GetConnectionLockAsync(priority, ct)
                 .ConfigureAwait(false);
+            if (healthCheckLease is not null)
+            {
+                var attachedHealthCheckLease = healthCheckLease;
+                connectionLock.AttachDisposeCallback(attachedHealthCheckLease.Dispose);
+                healthCheckLease = null;
             if (admissionLease is not null)
             {
                 connectionLock.AttachDisposeCallback(admissionLease.Dispose);
@@ -877,6 +896,7 @@ public class MultiConnectionNntpClient(
         }
         finally
         {
+            healthCheckLease?.Dispose();
             admissionLease?.Dispose();
         }
         var elapsed = Stopwatch.GetElapsedTime(started);
