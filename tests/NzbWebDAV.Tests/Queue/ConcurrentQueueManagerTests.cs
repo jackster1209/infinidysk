@@ -80,7 +80,7 @@ public sealed class ConcurrentQueueManagerTests : IAsyncLifetime
             new StreamTraceBuffer(100),
             new ActiveReadRegistry());
 
-        _queueManager = QueueManager.CreateForTests(
+        _queueManager = new QueueManager(
             usenet,
             _configManager,
             new WebsocketManager(),
@@ -88,8 +88,10 @@ public sealed class ConcurrentQueueManagerTests : IAsyncLifetime
             new WatchdogLog(),
             new QueueItemSourceTracker(),
             new BenchmarkGate(),
-            startLoop: false);
-        _queueManager.CreateDbContextOverride = () => new DavDatabaseContext(_options);
+            startLoop: false)
+        {
+            CreateDbContextOverride = () => new DavDatabaseContext(_options),
+        };
     }
 
     public Task DisposeAsync()

@@ -15,14 +15,7 @@ import type {
   HealthResult,
   RepairAction,
 } from "~/clients/backend-client.server";
-import {
-  completeHealthCheck,
-  getVisibleHealthCheckItems,
-  parseHealthItemProgressMessage,
-  parseHealthItemStatusMessage,
-  type HealthQueueState,
-  updateHealthCheckProgress,
-} from "./health-queue-state";
+import { completeHealthCheck, type HealthQueueState } from "./health-queue-state";
 import { withUrlBase } from "~/utils/url-base";
 
 const topicNames = {
@@ -175,13 +168,12 @@ export default function Health({ loaderData }: Route.ComponentProps) {
   // events
   const onHealthItemStatus = useCallback(
     (message: string) => {
-      const status = parseHealthItemStatusMessage(message);
-      if (!status) return;
-      setQueueState((x) => completeHealthCheck(x, status.davItemId));
+      const [davItemId, healthResult, repairAction] = message.split("|");
+      setQueueState((x) => completeHealthCheck(x, davItemId!));
       setHistoryStats((x) => {
         // 'hs' websocket payload carries numeric HealthResult / RepairAction enum values
-        const healthResultNum: HealthResult = status.healthResult;
-        const repairActionNum: RepairAction = status.repairAction;
+        const healthResultNum: HealthResult = Number(healthResult);
+        const repairActionNum: RepairAction = Number(repairAction);
 
         // attempt to find and update a matching statistic
         let updated = false;
@@ -214,11 +206,20 @@ export default function Health({ loaderData }: Route.ComponentProps) {
 
   const onHealthItemProgress = useCallback(
     (message: string) => {
-      const progressUpdate = parseHealthItemProgressMessage(message);
-      if (!progressUpdate) return;
-      setQueueState((queueState) =>
-        updateHealthCheckProgress(queueState, progressUpdate.davItemId, progressUpdate.progress),
-      );
+      const [davItemId, progress] = message.split("|");
+      if (progress === "done") return;
+      setQueueState((queueState) => {
+        const index = queueState.items.findIndex((x) => x.id === davItemId);
+        if (index === -1) return queueState;
+        return {
+          ...queueState,
+          items: queueState.items
+            .filter((_, i) => i >= index)
+            .map((item) =>
+              item.id === davItemId ? { ...item, progress: Number(progress) } : item,
+            ),
+        };
+      });
     },
     [setQueueState],
   );
@@ -264,7 +265,7 @@ export default function Health({ loaderData }: Route.ComponentProps) {
       />
       <HealthTable
         isEnabled={isEnabled}
-        healthCheckItems={getVisibleHealthCheckItems(queueItems)}
+        healthCheckItems={queueItems.filter((_, index) => index < 10)}
       />
     </div>
   );

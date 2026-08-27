@@ -250,7 +250,7 @@ public class QueueManagerLoopTests
             new StreamTraceBuffer(100),
             new ActiveReadRegistry());
 
-        return QueueManager.CreateForTests(
+        return new QueueManager(
             usenet,
             config,
             new WebsocketManager(),

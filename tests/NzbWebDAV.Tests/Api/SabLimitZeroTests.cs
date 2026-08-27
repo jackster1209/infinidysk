@@ -67,7 +67,7 @@ public sealed class SabLimitZeroTests : IAsyncLifetime
             new ProviderBytesTracker(),
             new StreamTraceBuffer(100),
             new ActiveReadRegistry());
-        _queueManager = QueueManager.CreateForTests(
+        _queueManager = new QueueManager(
             usenet,
             _configManager,
             websocketManager,

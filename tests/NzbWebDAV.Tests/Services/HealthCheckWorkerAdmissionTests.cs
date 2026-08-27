@@ -57,18 +57,12 @@ public sealed class HealthCheckWorkerAdmissionTests
     private sealed class HealthFixture : IAsyncDisposable
     {
         private readonly string _patchDirectory;
-        private readonly HealthCheckConnectionGate _healthCheckConnectionGate;
 
-        private HealthFixture(
-            HealthCheckService service,
-            ControllableTimeProvider time,
-            string patchDirectory,
-            HealthCheckConnectionGate healthCheckConnectionGate)
+        private HealthFixture(HealthCheckService service, ControllableTimeProvider time, string patchDirectory)
         {
             Service = service;
             Time = time;
             _patchDirectory = patchDirectory;
-            _healthCheckConnectionGate = healthCheckConnectionGate;
         }
 
         public HealthCheckService Service { get; }
@@ -85,7 +79,6 @@ public sealed class HealthCheckWorkerAdmissionTests
             var patchStore = new RepairPatchStore(patchDirectory, 1024 * 1024);
             await patchStore.CatalogLoadTask;
             var time = new ControllableTimeProvider();
-            var healthCheckConnectionGate = new HealthCheckConnectionGate(config);
             var service = new HealthCheckService(
                 config,
                 null!,
@@ -96,14 +89,12 @@ public sealed class HealthCheckWorkerAdmissionTests
                 new Par2RepairService(config, null!, patchStore),
                 patchStore,
                 new ArrReplacementSearchBudget(),
-                healthCheckConnectionGate,
                 timeProvider: time);
-            return new HealthFixture(service, time, patchDirectory, healthCheckConnectionGate);
+            return new HealthFixture(service, time, patchDirectory);
         }
 
         public ValueTask DisposeAsync()
         {
-            _healthCheckConnectionGate.Dispose();
             if (Directory.Exists(_patchDirectory))
                 Directory.Delete(_patchDirectory, recursive: true);
             return ValueTask.CompletedTask;

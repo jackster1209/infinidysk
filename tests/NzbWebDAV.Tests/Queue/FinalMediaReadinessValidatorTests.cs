@@ -406,14 +406,12 @@ public sealed class ImportReadinessFinalizeLockTests : IAsyncLifetime
 
         using var finalizeLock = new SemaphoreSlim(1, 1);
         var readinessReported = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var config = new ConfigManager();
-        using var healthCheckConnectionGate = new HealthCheckConnectionGate(config);
         var processor = new QueueItemProcessor(
             queueItem,
             CreateNzbStream(),
             _dbClient,
             client,
-            config,
+            new ConfigManager(),
             new WebsocketManager(),
             new ProviderUsageTracker(),
             new WatchdogLog(),
@@ -421,7 +419,6 @@ public sealed class ImportReadinessFinalizeLockTests : IAsyncLifetime
             new Progress<int>(),
             new ConcurrentDictionary<Guid, int>(),
             finalizeLock,
-            healthCheckConnectionGate,
             CancellationToken.None,
             stageReporter: stage =>
             {

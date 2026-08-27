@@ -78,7 +78,7 @@ public sealed class SabPauseResumeTests : IAsyncLifetime
             new ProviderBytesTracker(),
             new StreamTraceBuffer(100),
             new ActiveReadRegistry());
-        _queueManager = QueueManager.CreateForTests(
+        _queueManager = new QueueManager(
             usenet,
             _configManager,
             _websocketManager,
