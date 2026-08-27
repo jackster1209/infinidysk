@@ -9,6 +9,38 @@ namespace NzbWebDAV.Tests.Clients.Usenet;
 public class MultiConnectionStatsPipelinedTests
 {
     [Fact]
+    public async Task StatsPipelinedAsync_HoldsOneAdmissionLeaseForFullEnumeration()
+    {
+        var inner = new ExistsStatClient();
+        using var pool = new ConnectionPool<INntpClient>(
+            maxConnections: 1, _ => ValueTask.FromResult<INntpClient>(inner));
+        using var client = new MultiConnectionNntpClient(
+            pool,
+            ProviderType.Pooled,
+            new ProviderCircuitBreaker("stat-pipeline-admission"),
+            "stat-pipeline-admission",
+            maxTransferConnections: 1);
+
+        await using var enumerator = client.StatsPipelinedAsync(
+                ["a@example", "b@example"], depth: 8, CancellationToken.None)
+            .GetAsyncEnumerator();
+
+        Assert.True(await enumerator.MoveNextAsync());
+        var whileEnumerating = Assert.IsType<ProviderConnectionAdmissionSnapshot>(
+            client.GetConnectionAdmissionSnapshot());
+        Assert.Equal(1, whileEnumerating.ActiveMetadataOperations);
+        Assert.Equal(0, client.AvailableConnections);
+
+        Assert.True(await enumerator.MoveNextAsync());
+        Assert.False(await enumerator.MoveNextAsync());
+
+        var afterEnumeration = Assert.IsType<ProviderConnectionAdmissionSnapshot>(
+            client.GetConnectionAdmissionSnapshot());
+        Assert.Equal(0, afterEnumeration.ActiveMetadataOperations);
+        Assert.Equal(1, client.AvailableConnections);
+    }
+
+    [Fact]
     public async Task StatsPipelinedAsync_DoesNotRecordCircuitBreakerSuccess()
     {
         var inner = new ExistsStatClient();
