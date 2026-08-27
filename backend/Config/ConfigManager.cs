@@ -1910,19 +1910,6 @@ public class ConfigManager : IConfigReader, IConfigUpdater, IConfigChangeSource
     }
 
     /// <summary>
-    /// Routine background verification may coexist with queue processing only when
-    /// every enabled provider explicitly uses split Transfer/Metadata scheduling.
-    /// </summary>
-    public bool CanBackgroundHealthCoexistWithQueue()
-    {
-        var enabledProviders = GetUsenetProviderConfig().Providers
-            .Where(provider => provider.Type != ProviderType.Disabled)
-            .ToList();
-        return enabledProviders.Count > 0
-               && enabledProviders.All(provider => provider.MaxTransferConnections.HasValue);
-    }
-
-    /// <summary>
     /// How much of each file a health check reads. Unrecognized values fall back to the
     /// default rather than throwing, so a hand-edited database cannot stop health checks.
     /// </summary>

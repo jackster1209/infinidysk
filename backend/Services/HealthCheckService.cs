@@ -208,10 +208,12 @@ public class HealthCheckService : BackgroundService
         {
             if (_benchmarkGate.IsPaused || !_configManager.IsRepairJobEnabled()) return;
 
-            var queueActive = HasActiveQueueItems;
-            if (queueActive && !_configManager.CanBackgroundHealthCoexistWithQueue()) return;
+            // Preserve current-main admission semantics: do not start another library check
+            // while queue work is active. A check already in flight may overlap with newly
+            // admitted queue work, where the shared gate gives queue verification priority.
+            if (HasActiveQueueItems) return;
 
-            var allowUrgentRepair = !queueActive;
+            const bool allowUrgentRepair = true;
             var activeIds = _inProgress.Keys.ToHashSet();
             if (SelectCandidateOverride is { } selector)
             {

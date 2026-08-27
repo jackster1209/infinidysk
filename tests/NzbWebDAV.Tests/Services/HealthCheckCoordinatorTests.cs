@@ -67,6 +67,46 @@ public sealed class HealthCheckCoordinatorTests
     }
 
     [Fact]
+    public async Task FailedWorker_DoesNotStopOtherWorkers()
+    {
+        using var harness = new Harness(workers: 2, fullySplit: false);
+        var failed = Guid.NewGuid();
+        var running = Guid.NewGuid();
+        var ids = new Queue<Guid>([failed, running]);
+        var blocker = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        harness.Service.SelectCandidateOverride = (_, _, _) =>
+            Task.FromResult<Guid?>(ids.Count > 0 ? ids.Dequeue() : null);
+        harness.Service.ProcessCandidateOverride = (id, ct) => id == failed
+            ? Task.FromException(new InvalidOperationException("worker failure"))
+            : blocker.Task.WaitAsync(ct);
+
+        await harness.Service.RefillWorkerSlotsAsync(CancellationToken.None);
+        await WaitUntilAsync(() => !harness.Service.InProgressHealthCheckIds.Contains(failed));
+
+        Assert.Contains(running, harness.Service.InProgressHealthCheckIds);
+        blocker.TrySetResult();
+        await WaitUntilAsync(() => harness.Service.InProgressHealthCheckIds.Count == 0);
+    }
+
+    [Fact]
+    public async Task Cancellation_DrainsAllActiveWorkers()
+    {
+        using var harness = new Harness(workers: 2, fullySplit: false);
+        var ids = new Queue<Guid>([Guid.NewGuid(), Guid.NewGuid()]);
+        using var cancellation = new CancellationTokenSource();
+        harness.Service.SelectCandidateOverride = (_, _, _) =>
+            Task.FromResult<Guid?>(ids.Count > 0 ? ids.Dequeue() : null);
+        harness.Service.ProcessCandidateOverride = (_, ct) =>
+            Task.Delay(Timeout.InfiniteTimeSpan, ct);
+
+        await harness.Service.RefillWorkerSlotsAsync(cancellation.Token);
+        Assert.Equal(2, harness.Service.InProgressHealthCheckIds.Count);
+
+        await cancellation.CancelAsync();
+        await WaitUntilAsync(() => harness.Service.InProgressHealthCheckIds.Count == 0);
+    }
+
+    [Fact]
     public async Task DuplicateReservation_IsRejectedByInMemoryGuard()
     {
         using var harness = new Harness(workers: 2, fullySplit: false);
@@ -130,38 +170,21 @@ public sealed class HealthCheckCoordinatorTests
     }
 
     [Fact]
-    public async Task ActiveQueue_LegacyDefersButFullySplitAdmitsRoutineVerification()
+    public async Task ActiveQueue_DefersNewWorkersWithSplitProviderBudgets()
     {
-        using var legacy = new Harness(workers: 2, fullySplit: false);
-        var legacySelectorCalled = false;
-        legacy.Service.HasActiveQueueItemsOverride = () => true;
-        legacy.Service.SelectCandidateOverride = (_, _, _) =>
+        using var harness = new Harness(workers: 2, fullySplit: true);
+        var selectorCalled = false;
+        harness.Service.HasActiveQueueItemsOverride = () => true;
+        harness.Service.SelectCandidateOverride = (_, _, _) =>
         {
-            legacySelectorCalled = true;
+            selectorCalled = true;
             return Task.FromResult<Guid?>(Guid.NewGuid());
         };
 
-        await legacy.Service.RefillWorkerSlotsAsync(CancellationToken.None);
-        Assert.False(legacySelectorCalled);
-        Assert.Empty(legacy.Service.InProgressHealthCheckIds);
+        await harness.Service.RefillWorkerSlotsAsync(CancellationToken.None);
 
-        using var split = new Harness(workers: 1, fullySplit: true);
-        var allowUrgent = true;
-        var blocker = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        split.Service.HasActiveQueueItemsOverride = () => true;
-        split.Service.SelectCandidateOverride = (_, allowUrgentRepair, _) =>
-        {
-            allowUrgent = allowUrgentRepair;
-            return Task.FromResult<Guid?>(Guid.NewGuid());
-        };
-        split.Service.ProcessCandidateOverride = (_, ct) => blocker.Task.WaitAsync(ct);
-
-        await split.Service.RefillWorkerSlotsAsync(CancellationToken.None);
-
-        Assert.False(allowUrgent);
-        Assert.Single(split.Service.InProgressHealthCheckIds);
-        blocker.TrySetResult();
-        await WaitUntilAsync(() => split.Service.InProgressHealthCheckIds.Count == 0);
+        Assert.False(selectorCalled);
+        Assert.Empty(harness.Service.InProgressHealthCheckIds);
     }
 
     [Fact]

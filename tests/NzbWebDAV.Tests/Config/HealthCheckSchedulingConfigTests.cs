@@ -29,37 +29,6 @@ public sealed class HealthCheckSchedulingConfigTests
         Assert.Equal(expected, config.GetHealthCheckWorkers());
     }
 
-    [Theory]
-    [InlineData(ProviderType.Pooled)]
-    [InlineData(ProviderType.BackupAndStats)]
-    [InlineData(ProviderType.BackupOnly)]
-    public void CanBackgroundHealthCoexistWithQueue_RequiresEveryEnabledProviderToBeSplit(
-        ProviderType secondProviderType)
-    {
-        var config = CreateProviderConfig(
-            MakeProvider(ProviderType.Pooled, 8),
-            MakeProvider(secondProviderType, null));
-
-        Assert.False(config.CanBackgroundHealthCoexistWithQueue());
-    }
-
-    [Fact]
-    public void CanBackgroundHealthCoexistWithQueue_AllowsFullySplitConfiguration()
-    {
-        var config = CreateProviderConfig(
-            MakeProvider(ProviderType.Pooled, 8),
-            MakeProvider(ProviderType.BackupOnly, 2),
-            MakeProvider(ProviderType.Disabled, null));
-
-        Assert.True(config.CanBackgroundHealthCoexistWithQueue());
-    }
-
-    [Fact]
-    public void CanBackgroundHealthCoexistWithQueue_RejectsEmptyConfiguration()
-    {
-        Assert.False(new ConfigManager().CanBackgroundHealthCoexistWithQueue());
-    }
-
     [Fact]
     public void HeadlessOverlay_MapsHealthCheckWorkers()
     {
