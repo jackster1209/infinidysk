@@ -405,7 +405,6 @@ public class ConfigManager : IConfigReader, IConfigUpdater, IConfigChangeSource
                 case ConfigKeys.WatchtowerSeriesRecentCount:
                 case ConfigKeys.WatchtowerSeasonBundleFallbackRecentCount:
                 case ConfigKeys.WatchtowerSeasonBundleFallbackMaxEpisodes:
-                case ConfigKeys.RepairHealthcheckConcurrency:
                 case ConfigKeys.RepairAutoRemoveAfterFailures:
                 case ConfigKeys.DatabaseHistoryRetentionDays:
                 case ConfigKeys.DatabaseHealthcheckRetentionDays:
@@ -415,6 +414,17 @@ public class ConfigManager : IConfigReader, IConfigUpdater, IConfigChangeSource
                 case ConfigKeys.ApiNzbBackupRetentionDays:
                 case ConfigKeys.QueueSpeedLimitKbps:
                     RequireLong(item.ConfigName, value);
+                    break;
+
+                case ConfigKeys.RepairHealthcheckConcurrency:
+                    // Keep accepting values persisted by earlier releases. The getter
+                    // applies the current safe runtime bounds without making upgrades
+                    // fail configuration validation.
+                    RequireLong(item.ConfigName, value);
+                    break;
+
+                case ConfigKeys.RepairHealthcheckWorkers:
+                    RequireLongInRange(item.ConfigName, value, 1, 8);
                     break;
 
                 case ConfigKeys.ProwlarrSyncIntervalMinutes:
@@ -656,6 +666,13 @@ public class ConfigManager : IConfigReader, IConfigUpdater, IConfigChangeSource
                     throw new ArgumentException($"Provider '{label}': port must be between 1 and 65535, but was {p.Port}.");
                 if (p.MaxConnections < 1)
                     throw new ArgumentException($"Provider '{label}': max connections must be at least 1, but was {p.MaxConnections}.");
+                if (p.MaxTransferConnections is < 1)
+                    throw new ArgumentException(
+                        $"Provider '{label}': transfer connections must be at least 1, but was {p.MaxTransferConnections}.");
+                if (p.MaxTransferConnections > p.MaxConnections)
+                    throw new ArgumentException(
+                        $"Provider '{label}': transfer connections must not exceed max connections " +
+                        $"({p.MaxConnections}), but was {p.MaxTransferConnections}.");
                 if (p.ByteLimit is < 0)
                     throw new ArgumentException($"Provider '{label}': byte limit must not be negative.");
             }
@@ -1870,17 +1887,26 @@ public class ConfigManager : IConfigReader, IConfigUpdater, IConfigChangeSource
     }
 
     /// <summary>
-    /// Max concurrent NNTP STAT connections for health checks.
-    /// Capped at the configured provider pool size to avoid pool starvation.
+    /// Maximum aggregate NNTP verification connections shared by background health
+    /// checks and queue article-existence validation.
     /// </summary>
     public int GetHealthCheckConcurrency()
     {
-        var poolSize = GetUsenetProviderConfig().TotalPooledConnections;
-        var configured = int.Parse(
-            StringUtil.EmptyToNull(GetConfigValue(ConfigKeys.RepairHealthcheckConcurrency))
-            ?? "50"
-        );
-        return Math.Clamp(configured, 1, Math.Max(1, poolSize));
+        var poolSize = Math.Max(1, GetUsenetProviderConfig().TotalPooledConnections);
+        var maximum = Math.Min(200, poolSize);
+        var configured = StringUtil.EmptyToNull(GetConfigValue(ConfigKeys.RepairHealthcheckConcurrency));
+        var value = long.TryParse(configured, out var parsed) ? parsed : 50;
+        return (int)Math.Clamp(value, 1L, maximum);
+    }
+
+    /// <summary>
+    /// Maximum number of library files that may be health-checked concurrently.
+    /// Each worker shares the aggregate health connection limit above.
+    /// </summary>
+    public int GetHealthCheckWorkers()
+    {
+        var configured = StringUtil.EmptyToNull(GetConfigValue(ConfigKeys.RepairHealthcheckWorkers));
+        return int.TryParse(configured, out var value) ? Math.Clamp(value, 1, 8) : 1;
     }
 
     /// <summary>
