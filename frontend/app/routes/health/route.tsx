@@ -217,11 +217,7 @@ export default function Health({ loaderData }: Route.ComponentProps) {
       const progressUpdate = parseHealthItemProgressMessage(message);
       if (!progressUpdate) return;
       setQueueState((queueState) =>
-        updateHealthCheckProgress(
-          queueState,
-          progressUpdate.davItemId,
-          progressUpdate.progress,
-        ),
+        updateHealthCheckProgress(queueState, progressUpdate.davItemId, progressUpdate.progress),
       );
     },
     [setQueueState],
