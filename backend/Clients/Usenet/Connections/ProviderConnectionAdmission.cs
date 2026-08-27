@@ -265,13 +265,13 @@ internal sealed class ProviderConnectionAdmission : IDisposable
     private LinkedList<Waiter> GetQueue(
         ProviderConnectionKind kind,
         SemaphorePriority priority) => (kind, priority) switch
-    {
-        (ProviderConnectionKind.Transfer, SemaphorePriority.High) => _transferHighWaiters,
-        (ProviderConnectionKind.Transfer, SemaphorePriority.Low) => _transferLowWaiters,
-        (ProviderConnectionKind.Metadata, SemaphorePriority.High) => _metadataHighWaiters,
-        (ProviderConnectionKind.Metadata, SemaphorePriority.Low) => _metadataLowWaiters,
-        _ => throw new ArgumentOutOfRangeException(nameof(kind), kind, null),
-    };
+        {
+            (ProviderConnectionKind.Transfer, SemaphorePriority.High) => _transferHighWaiters,
+            (ProviderConnectionKind.Transfer, SemaphorePriority.Low) => _transferLowWaiters,
+            (ProviderConnectionKind.Metadata, SemaphorePriority.High) => _metadataHighWaiters,
+            (ProviderConnectionKind.Metadata, SemaphorePriority.Low) => _metadataLowWaiters,
+            _ => throw new ArgumentOutOfRangeException(nameof(kind), kind, null),
+        };
 
     private static void CompleteReadyWaiters(
         List<(TaskCompletionSource<Lease> Completion, Lease Lease)> ready)

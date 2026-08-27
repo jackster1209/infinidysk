@@ -197,7 +197,8 @@ public class HealthCheckService : BackgroundService
             {
                 try { await Task.WhenAll(workers).ConfigureAwait(false); }
                 catch (OperationCanceledException) when (
-                    stoppingToken.IsCancellationRequested || SigtermUtil.IsSigtermTriggered()) { }
+                    stoppingToken.IsCancellationRequested || SigtermUtil.IsSigtermTriggered())
+                { }
             }
         }
     }

@@ -116,15 +116,15 @@ public sealed class HealthCheckSchedulingConfigTests
     private static UsenetProviderConfig.ConnectionDetails MakeProvider(
         ProviderType type,
         int? maxTransferConnections) => new()
-    {
-        ProviderId = Guid.NewGuid(),
-        Type = type,
-        Host = $"{Guid.NewGuid():N}.example",
-        Port = 563,
-        UseSsl = true,
-        User = "user",
-        Pass = "pass",
-        MaxConnections = 10,
-        MaxTransferConnections = maxTransferConnections,
-    };
+        {
+            ProviderId = Guid.NewGuid(),
+            Type = type,
+            Host = $"{Guid.NewGuid():N}.example",
+            Port = 563,
+            UseSsl = true,
+            User = "user",
+            Pass = "pass",
+            MaxConnections = 10,
+            MaxTransferConnections = maxTransferConnections,
+        };
 }
