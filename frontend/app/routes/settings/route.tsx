@@ -180,6 +180,7 @@ const defaultConfig = {
   "repair.healthcheck-aging": "false",
   "repair.auto-remove-after-failures": "0",
   "repair.auto-remove-unlinked-only": "true",
+  "repair.allow-unverified-arr-replacement": "false",
   "repair.par2-enabled": "true",
   "repair.par2-preferred-over-arr": "true",
   "repair.par2-max-missing-slices": "8",

@@ -567,6 +567,7 @@ public class ConfigManager : IConfigReader, IConfigUpdater, IConfigChangeSource
                 case ConfigKeys.RepairPar2PreferredOverArr:
                 case ConfigKeys.RepairHealthcheckAging:
                 case ConfigKeys.RepairAutoRemoveUnlinkedOnly:
+                case ConfigKeys.RepairAllowUnverifiedArrReplacement:
                 case ConfigKeys.RcloneRcEnabled:
                 case ConfigKeys.DbIsStartupVacuumEnabled:
                 case ConfigKeys.MaintenanceRemoveOrphanedScheduleEnabled:
@@ -2317,6 +2318,18 @@ public class ConfigManager : IConfigReader, IConfigUpdater, IConfigChangeSource
     {
         var configValue = StringUtil.EmptyToNull(GetConfigValue(ConfigKeys.RepairAutoRemoveUnlinkedOnly));
         return configValue == null || bool.Parse(configValue);
+    }
+
+    /// <summary>
+    /// When enabled, an unhealthy linked item whose exact Arr media file is known may be
+    /// removed and searched again even when the original download provenance cannot be proven.
+    /// The failed release cannot be blocklisted in this fallback path. Off by default.
+    /// </summary>
+    public bool IsUnverifiedArrReplacementAllowed()
+    {
+        var configValue = StringUtil.EmptyToNull(
+            GetConfigValue(ConfigKeys.RepairAllowUnverifiedArrReplacement));
+        return configValue != null && bool.Parse(configValue);
     }
 
     public ArrConfig GetArrConfig()

@@ -106,6 +106,7 @@ public static class ConfigKeys
     public const string RepairHealthcheckAging = "repair.healthcheck-aging";
     public const string RepairAutoRemoveAfterFailures = "repair.auto-remove-after-failures";
     public const string RepairAutoRemoveUnlinkedOnly = "repair.auto-remove-unlinked-only";
+    public const string RepairAllowUnverifiedArrReplacement = "repair.allow-unverified-arr-replacement";
     public const string RepairPar2Enabled = "repair.par2-enabled";
     public const string RepairPar2PreferredOverArr = "repair.par2-preferred-over-arr";
     public const string RepairPar2MaxMissingSlices = "repair.par2-max-missing-slices";
