@@ -1,7 +1,6 @@
 ﻿using System.Diagnostics;
 using System.Runtime.ExceptionServices;
 using NzbWebDAV.Clients.Usenet;
-using NzbWebDAV.Clients.Usenet.Contexts;
 using NzbWebDAV.Clients.Usenet.Models;
 using NzbWebDAV.Exceptions;
 using NzbWebDAV.Extensions;
@@ -112,7 +111,6 @@ public class NzbFileStream(
 
     private async Task ReadPar2CandidateAsync(long start, Memory<byte> target, CancellationToken cancellationToken)
     {
-        using var validation = YencFileValidationContext.BeginBufferedPar2ProofRead(fileSegmentIds, segmentFallbacks);
         await using var candidate = new NzbFileStream(
             fileSegmentIds, Length, usenetClient, articleBufferSize: articleBufferSize,
             segmentByteRanges: _segmentByteRanges, usePipelinedBodyRequests: usePipelinedBodyRequests,
@@ -143,7 +141,6 @@ public class NzbFileStream(
     {
         if (verificationProof is not null)
             return await VerifiedStream.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
-        using var yencFileValidation = YencFileValidationContext.BeginStreaming(fileSegmentIds, segmentFallbacks);
         if (buffer.IsEmpty) return 0;
         if (_position >= fileSize) return 0;
         // A prior Seek started the old inner stream's teardown non-blocking; join it

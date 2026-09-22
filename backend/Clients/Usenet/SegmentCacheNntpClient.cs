@@ -3,7 +3,6 @@ using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
-using NzbWebDAV.Clients.Usenet.Contexts;
 using NzbWebDAV.Database.Models.Metrics;
 using NzbWebDAV.Clients.Usenet.Models;
 using NzbWebDAV.Services;
@@ -389,8 +388,7 @@ public sealed class SegmentCacheNntpClient : WrappingNntpClient
                 File.ReadAllText(blobPath + ".h"), HeaderJsonOptions);
             if (header == null
                 || header.PartSize != entry.Size
-                || !IsCoherentHeader(header)
-                || !YencFileValidationContext.MatchesExpectedFile(header))
+                || !IsCoherentHeader(header))
             {
                 RecordReadFailureAndDrop(hash);
                 return CacheLookupResult.ReadFailure;

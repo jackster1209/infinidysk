@@ -1,5 +1,4 @@
 using System.Collections.Concurrent;
-using NzbWebDAV.Clients.Usenet.Contexts;
 using UsenetSharp.Models;
 
 namespace NzbWebDAV.Clients.Usenet;
@@ -30,13 +29,7 @@ public class HeaderCachingNntpClient(INntpClient usenetClient) : WrappingNntpCli
 
     public override async Task<UsenetYencHeader> GetYencHeadersAsync(string segmentId, CancellationToken ct)
     {
-        if (_cache.TryGetValue(segmentId, out var cached))
-        {
-            if (YencFileValidationContext.MatchesExpectedFile(cached))
-                return cached;
-
-            _cache.TryRemove(segmentId, out _);
-        }
+        if (_cache.TryGetValue(segmentId, out var cached)) return cached;
 
         var header = await base.GetYencHeadersAsync(segmentId, ct).ConfigureAwait(false);
 
@@ -48,8 +41,7 @@ public class HeaderCachingNntpClient(INntpClient usenetClient) : WrappingNntpCli
             }
         }
 
-        if (YencFileValidationContext.MatchesExpectedFile(header))
-            _cache.TryAdd(segmentId, header);
+        _cache.TryAdd(segmentId, header);
         return header;
     }
 }
