@@ -1,6 +1,7 @@
 ﻿using System.Diagnostics;
 using System.Runtime.ExceptionServices;
 using NzbWebDAV.Clients.Usenet;
+using NzbWebDAV.Clients.Usenet.Contexts;
 using NzbWebDAV.Clients.Usenet.Models;
 using NzbWebDAV.Exceptions;
 using NzbWebDAV.Extensions;
