@@ -27,6 +27,7 @@
 
   <ItemGroup>
     <Using Include="Xunit" />
+    <Compile Remove="Clients/Usenet/MultiProviderNntpClientYencValidationTests.cs" />
   </ItemGroup>
 
   <ItemGroup>

@@ -150,7 +150,6 @@ public abstract class NntpClient : INntpClient
                 throw new InvalidDataException("Invalid PAR2 verification metadata.");
             return proof.FileLength;
         }
-        using var yencFileValidation = YencFileValidationContext.BeginSizeProbe(file);
         var headers = await GetYencHeadersAsync(file.Segments[^1].MessageId, ct).ConfigureAwait(false);
         file.Segments[^1].ByteRange = LongRange.FromStartAndSize(headers.PartOffset, headers.PartSize);
         return headers.PartOffset + headers.PartSize;

@@ -389,8 +389,7 @@ public sealed class SegmentCacheNntpClient : WrappingNntpClient
                 File.ReadAllText(blobPath + ".h"), HeaderJsonOptions);
             if (header == null
                 || header.PartSize != entry.Size
-                || !IsCoherentHeader(header)
-                || !YencFileValidationContext.MatchesExpectedFile(header, id))
+                || !IsCoherentHeader(header))
             {
                 RecordReadFailureAndDrop(hash);
                 return CacheLookupResult.ReadFailure;
