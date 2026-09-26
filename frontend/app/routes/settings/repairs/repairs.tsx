@@ -131,6 +131,33 @@ export function RepairsSettings({ config, setNewConfig }: RepairsSettingsProps) 
                 </p>
               </div>
             </ManagedSetting>
+
+            <ManagedSetting configKey="repair.allow-unverified-arr-replacement">
+              <Tooltip
+                className="tooltip-start"
+                content="Off by default. When an unhealthy linked file can be matched to an exact Radarr/Sonarr media item but its original download history cannot be verified, remove the media file and request a replacement search without blocklisting the original release. The same release may be grabbed again. Unreachable Arr instances, path mismatches, missing library links, and repair-loop safeguards still defer normally."
+              >
+                <Toggle
+                  id="allow-unverified-arr-replacement-checkbox"
+                  className="cursor-pointer gap-2 p-0"
+                  checked={
+                    (config["repair.allow-unverified-arr-replacement"] ?? "false") === "true"
+                  }
+                  disabled={!isRepairEnabled || !libraryDirConfig || !hasEnabledArrInstance}
+                  onChange={(e) =>
+                    setNewConfig({
+                      ...config,
+                      "repair.allow-unverified-arr-replacement": "" + e.target.checked,
+                    })
+                  }
+                  label={
+                    <span className="text-sm text-base-content">
+                      Replace files with missing Arr history
+                    </span>
+                  }
+                />
+              </Tooltip>
+            </ManagedSetting>
           </div>
 
           <fieldset className="fieldset w-full border-t border-base-content/10 pt-2">
@@ -725,6 +752,8 @@ export function isRepairsSettingsUpdated(
     config["repair.auto-remove-after-failures"] !==
       newConfig["repair.auto-remove-after-failures"] ||
     config["repair.auto-remove-unlinked-only"] !== newConfig["repair.auto-remove-unlinked-only"] ||
+    config["repair.allow-unverified-arr-replacement"] !==
+      newConfig["repair.allow-unverified-arr-replacement"] ||
     config["repair.par2-enabled"] !== newConfig["repair.par2-enabled"] ||
     config["repair.par2-preferred-over-arr"] !== newConfig["repair.par2-preferred-over-arr"] ||
     config["repair.par2-max-missing-slices"] !== newConfig["repair.par2-max-missing-slices"] ||

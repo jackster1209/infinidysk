@@ -2880,6 +2880,17 @@ public class HealthCheckService : BackgroundService, IHealthCheckQuiescence
         /// <summary>Arr confirmed blocklisting, but replacement-search completion is unconfirmed.</summary>
         MediaRemovedBlocklistConfirmedSearchUnconfirmed,
         /// <summary>
+        /// Exact Arr media was removed and a replacement search was requested without blocklisting
+        /// because the original download provenance could not be verified.
+        /// </summary>
+        RemoveWithoutBlocklistSucceeded,
+        /// <summary>Exact Arr media was removed, but the replacement-search budget withheld search.</summary>
+        RemoveWithoutBlocklistSucceededSearchWithheld,
+        /// <summary>Exact Arr media was removed, but the explicit replacement search failed.</summary>
+        RemoveWithoutBlocklistSucceededSearchFailed,
+        /// <summary>Exact Arr media was removed, but no replacement search targets were available.</summary>
+        RemoveWithoutBlocklistSucceededNoSearchTargets,
+        /// <summary>
         /// At least one Arr instance was unreachable/unusable and no instance completed repair —
         /// leave the DavItem in place.
         /// </summary>
@@ -2958,7 +2969,8 @@ public class HealthCheckService : BackgroundService, IHealthCheckQuiescence
         CancellationToken ct,
         Func<ArrClient, IReadOnlyList<string>, bool>? shouldRequestSearch = null,
         ArrInstanceBackoff? arrBackoff = null,
-        Guid? legacyDownloadId = null)
+        Guid? legacyDownloadId = null,
+        bool allowUnverifiedReplacement = false)
     {
         var anInstanceFailed = false;
         var sawConfiguredClient = false;
@@ -2969,6 +2981,9 @@ public class HealthCheckService : BackgroundService, IHealthCheckQuiescence
         Guid? recoveredDownloadId = null;
         string? recoveryHost = null;
         var recoveredConflict = false;
+        ArrClient? unverifiedReplacementClient = null;
+        ArrMediaFileMatch? unverifiedReplacementMediaFile = null;
+        var unverifiedReplacementOwnerConflict = false;
 
         foreach (var arrClient in arrClients)
         {
@@ -3039,6 +3054,18 @@ public class HealthCheckService : BackgroundService, IHealthCheckQuiescence
 
             if (mediaFile is null)
                 continue;
+
+            if (unverifiedReplacementClient is null)
+            {
+                unverifiedReplacementClient = arrClient;
+                unverifiedReplacementMediaFile = mediaFile;
+            }
+            else if (!ReferenceEquals(unverifiedReplacementClient, arrClient))
+            {
+                // More than one enabled Arr instance claims the exact organized path.
+                // Never use the unverified fallback when ownership itself is ambiguous.
+                unverifiedReplacementOwnerConflict = true;
+            }
 
             var effectiveId = downloadId;
             if (effectiveId is null)
@@ -3173,6 +3200,49 @@ public class HealthCheckService : BackgroundService, IHealthCheckQuiescence
         {
             return new ArrLinkedRepairResult(
                 ArrLinkedRepairDecision.DeferUnreachable, recovered, recoveryHost);
+        }
+
+        var provenanceUnavailable =
+            sawAmbiguousIdentity || sawMissingIdentity || sawMissingDownloadHistory;
+        if (allowUnverifiedReplacement
+            && provenanceUnavailable
+            && !unverifiedReplacementOwnerConflict
+            && unverifiedReplacementClient is { } fallbackClient
+            && unverifiedReplacementMediaFile is { } fallbackMediaFile)
+        {
+            try
+            {
+                var fallbackOutcome = await fallbackClient.RemoveMissingPayloadAndSearchAsync(
+                    fallbackMediaFile,
+                    shouldRequestSearch is null
+                        ? null
+                        : identities => shouldRequestSearch(fallbackClient, identities),
+                    ct).ConfigureAwait(false);
+
+                var fallbackDecision = fallbackOutcome switch
+                {
+                    ArrMissingPayloadCleanupOutcome.RemovedSearchRequested =>
+                        ArrLinkedRepairDecision.RemoveWithoutBlocklistSucceeded,
+                    ArrMissingPayloadCleanupOutcome.RemovedSearchWithheld =>
+                        ArrLinkedRepairDecision.RemoveWithoutBlocklistSucceededSearchWithheld,
+                    ArrMissingPayloadCleanupOutcome.RemovedSearchFailed =>
+                        ArrLinkedRepairDecision.RemoveWithoutBlocklistSucceededSearchFailed,
+                    ArrMissingPayloadCleanupOutcome.RemovedNoSearchTargets =>
+                        ArrLinkedRepairDecision.RemoveWithoutBlocklistSucceededNoSearchTargets,
+                    _ => (ArrLinkedRepairDecision?)null,
+                };
+
+                if (fallbackDecision is { } decision)
+                    return new ArrLinkedRepairResult(decision, recovered, recoveryHost);
+            }
+            catch (Exception e) when (
+                e is HttpRequestException or TaskCanceledException or InvalidOperationException)
+            {
+                LogArrRepairFailure(
+                    e,
+                    "Health-check repair: unverified Arr replacement fallback failed on {Host}",
+                    fallbackClient.Host);
+            }
         }
 
         if (sawAmbiguousIdentity)
@@ -3525,7 +3595,9 @@ public class HealthCheckService : BackgroundService, IHealthCheckQuiescence
                     arrConfig.EffectiveQueueReplacementSearchLimit(),
                     arrConfig.EffectiveQueueReplacementSearchWindow()),
                 _arrBackoff,
-                legacyDownloadId: davItem.NzbBlobId ?? davItem.HistoryItemId).ConfigureAwait(false);
+                legacyDownloadId: davItem.NzbBlobId ?? davItem.HistoryItemId,
+                allowUnverifiedReplacement: _configManager.IsUnverifiedArrReplacementAllowed())
+                .ConfigureAwait(false);
 
             if (davItem.ArrDownloadId is null && arrResult.RecoveredDownloadId is { } recovered)
             {
@@ -3595,6 +3667,50 @@ public class HealthCheckService : BackgroundService, IHealthCheckQuiescence
                         "Removed the Arr media file and blocklisted its original download.",
                         searchClause
                     ]), CancellationToken.None).ConfigureAwait(false);
+                return;
+            }
+
+            if (arrDecision is ArrLinkedRepairDecision.RemoveWithoutBlocklistSucceeded
+                or ArrLinkedRepairDecision.RemoveWithoutBlocklistSucceededSearchWithheld
+                or ArrLinkedRepairDecision.RemoveWithoutBlocklistSucceededSearchFailed
+                or ArrLinkedRepairDecision.RemoveWithoutBlocklistSucceededNoSearchTargets)
+            {
+                RecordRepairRemoval(linkedPath, DateTimeOffset.UtcNow);
+                await SeedRejectedReleaseSegmentsAsync(davItem, dbClient, ct).ConfigureAwait(false);
+                DeletionAuditLog.Record(
+                    "health-repair",
+                    davItem,
+                    "health validation failed; Arr media removed without blocklisting because original download provenance was unavailable");
+                RemoveDavItemWithGeneratedSidecars(dbClient, davItem);
+                _failureTracker.ClearFailure(davItem.Id);
+
+                var searchClause = arrDecision switch
+                {
+                    ArrLinkedRepairDecision.RemoveWithoutBlocklistSucceeded =>
+                        "Arr was notified to search for a replacement.",
+                    ArrLinkedRepairDecision.RemoveWithoutBlocklistSucceededSearchWithheld =>
+                        "The automatic replacement search was withheld because the per-media search limit was reached.",
+                    ArrLinkedRepairDecision.RemoveWithoutBlocklistSucceededSearchFailed =>
+                        "The Arr media file was removed, but the replacement search request failed.",
+                    _ =>
+                        "The Arr media file was removed, but no replacement search targets were available.",
+                };
+                var repairStatus = arrDecision is
+                    ArrLinkedRepairDecision.RemoveWithoutBlocklistSucceededSearchFailed or
+                    ArrLinkedRepairDecision.RemoveWithoutBlocklistSucceededNoSearchTargets
+                    ? HealthCheckResult.RepairAction.Deleted
+                    : HealthCheckResult.RepairAction.Repaired;
+
+                await RecordHealthResult(
+                    dbClient, davItem,
+                    HealthCheckResult.HealthResult.Unhealthy,
+                    repairStatus,
+                    string.Join(" ", [
+                        "File failed health validation.",
+                        $"Corresponding {linkType} and Arr media item found.",
+                        "Removed the Arr media file without blocklisting because the original download provenance could not be verified.",
+                        searchClause
+                    ]), ct).ConfigureAwait(false);
                 return;
             }
 

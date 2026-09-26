@@ -18,6 +18,7 @@ Background health monitoring, PAR2 reconstruction, and replacement of unhealthy 
 | Check older releases less thoroughly [since 0.8.0](https://github.com/infinidysk/infinidysk/releases/tag/v0.8.0){ .nzbdav-since } | `repair.healthcheck-aging` | off | Aging taper |
 | Repair After Streaming Failures | `repair.auto-remove-after-failures` | `0` | Consecutive streaming failures before urgent repair; `0` = immediate repair. Failures below the threshold are counted in memory and reset when InfiniDysk restarts. Once the threshold is reached and the urgent repair is scheduled, that qualification is stored with the file and survives restarts; raising the threshold afterwards defers the repair again until the new threshold is met. |
 | Auto-remove unlinked files only | `repair.auto-remove-unlinked-only` | on | At the threshold, linked items are removed and blocklisted through *Arr instead of force-deleted |
+| Replace files with missing Arr history | `repair.allow-unverified-arr-replacement` | off | If an exact Arr media file is known but its original download provenance is unavailable, remove it and request a replacement without blocklisting the original release |
 | Degraded damage tolerance [since 1.2.0](https://github.com/infinidysk/infinidysk/releases/tag/v1.2.0){ .nzbdav-since } | `repair.degraded-tolerance-enabled` | on | Keep slightly damaged videos playable instead of replacing the release |
 | Track corrupt articles during playback [since 1.2.0](https://github.com/infinidysk/infinidysk/releases/tag/v1.2.0){ .nzbdav-since } | `repair.corruption-tracking-enabled` | on | Record streaming-confirmed corrupt articles, include them in health classification, and skip the retry storm on later reads |
 | Max consecutive missing segments | `repair.degraded-max-consecutive-missing` | `2` | Longest tolerable run of adjacent holes (1–2) |
@@ -142,6 +143,13 @@ to recover the original download from exact Arr import history, then falls back 
 `nzo_id`. Arr must still confirm grabbed history for that ID before InfiniDysk removes the media,
 marks the download failed, or requests a replacement. If that history has expired, the file remains
 untouched and is surfaced as **Action needed** instead of risking the wrong release.
+
+Enable **Replace files with missing Arr history** (`repair.allow-unverified-arr-replacement`) to opt
+into the legacy fallback for this case. When InfiniDysk can still identify one exact Arr media file
+but cannot prove the original download identity/history, it removes that media file and requests a
+replacement search without blocklisting the failed release. The same release can therefore be
+grabbed again. This option does not override unreachable-Arr, root-path, missing-library-link, or
+repair-loop deferrals.
 
 Successful full-file playback and a successful background health check reset the in-memory failure
 count. The count resets when InfiniDysk restarts, so it is intentionally not a durable replacement for
