@@ -673,8 +673,6 @@ public class MultiProviderNntpClient(
             try
             {
                 response = await primaryResponse.ConfigureAwait(false);
-                await RejectMismatchedYencFileAsync(
-                    segmentId, primaryProvider.MetricsKey, response, cancellationToken).ConfigureAwait(false);
             }
             catch (NntpClientRetiredException)
             {
@@ -861,8 +859,6 @@ public class MultiProviderNntpClient(
                         response = await provider.DecodedBodyAsync(
                             segmentId, deferredCallback.Invoke, fallbackAdmissionContext,
                             cancellationToken).ConfigureAwait(false);
-                        await RejectMismatchedYencFileAsync(
-                            segmentId, provider.MetricsKey, response, cancellationToken).ConfigureAwait(false);
                         stopwatch.Stop();
                         var responseType = response.ResponseType;
                         if (responseType == UsenetResponseType.ArticleRetrievedBodyFollows)
@@ -1218,8 +1214,6 @@ public class MultiProviderNntpClient(
                 walk.Attempts++;
                 var result = await task(provider, deferredCallback.Invoke, admissionFailoverContext, cancellationToken)
                     .ConfigureAwait(false);
-                await RejectMismatchedYencFileAsync(
-                    segmentId, provider.MetricsKey, result, cancellationToken).ConfigureAwait(false);
                 stopwatch.Stop();
                 if (result.ResponseType == successResponseType)
                 {
@@ -1415,8 +1409,6 @@ public class MultiProviderNntpClient(
                 MovePendingSelection(ref attemptReserved, provider, operation);
                 walk.Attempts++;
                 var result = await task(provider, admissionFailoverContext, cancellationToken).ConfigureAwait(false);
-                await RejectMismatchedYencFileAsync(
-                    articleId, provider.MetricsKey, result, cancellationToken).ConfigureAwait(false);
                 stopwatch.Stop();
 
                 // if no article with that message-id is found, try again with the next provider.
@@ -1547,57 +1539,6 @@ public class MultiProviderNntpClient(
         throw new InvalidOperationException("There are no usenet providers configured.");
     }
 
-    private static async Task RejectMismatchedYencFileAsync(
-        SegmentId? requestedId,
-        string providerKey,
-        UsenetResponse response,
-        CancellationToken cancellationToken)
-    {
-        if (requestedId is not { } segmentId
-            || YencFileValidationContext.CurrentExpectedTotalParts is not { } expectedTotalParts)
-            return;
-
-        var bodyStream = response switch
-        {
-            UsenetDecodedBodyResponse
-            {
-                ResponseType: UsenetResponseType.ArticleRetrievedBodyFollows,
-                Stream: { } stream,
-            } => stream,
-            UsenetDecodedArticleResponse
-            {
-                ResponseType: UsenetResponseType.ArticleRetrievedHeadAndBodyFollow,
-                Stream: { } stream,
-            } => stream,
-            _ => null,
-        };
-        if (bodyStream is null) return;
-
-        UsenetYencHeader? header;
-        try
-        {
-            header = await bodyStream.GetYencHeadersAsync(cancellationToken).ConfigureAwait(false);
-        }
-        catch
-        {
-            await bodyStream.DisposeAsync().ConfigureAwait(false);
-            throw;
-        }
-
-        if (header is null || YencFileValidationContext.MatchesExpectedFile(header, segmentId.ToString()))
-            return;
-
-        YencFileValidationContext.Current?.ReportMismatch(
-            segmentId.ToString(), providerKey, response.ResponseCode, header);
-        await bodyStream.DisposeAsync().ConfigureAwait(false);
-
-        throw new UsenetMismatchedArticleException(
-            segmentId,
-            header.PartNumber,
-            header.TotalParts,
-            expectedTotalParts);
-    }
-
     private bool IsCachedMissing(SegmentId segmentId, MultiConnectionNntpClient provider,
         NntpOperation operation)
     {
@@ -1631,8 +1572,6 @@ public class MultiProviderNntpClient(
         if (segmentId is not { } id) return;
         AttachProviderGeneration(exception);
         if (ClassifyException(exception) != SegmentFetch.FetchStatus.Missing) return;
-        if (exception.TryGetCausingException<UsenetMismatchedArticleException>(out _))
-            return;
         var group = NormalizeStorageGroup(provider.StorageGroup);
         if (group.Length > 0) missingGroups.Add(group);
         MarkCachedMissing(id, provider, operation);
