@@ -725,7 +725,7 @@ public class MultiProviderNntpClient(
                     if (awaiting) _awaitingBody.TryRemove(KeyValuePair.Create(segmentId, primaryProvider));
                 }
 
-                await RejectMismatchedYencFileAsync(
+                await RejectMismatchedFirstSegmentAsync(
                     segmentId, primaryProvider.MetricsKey, response, cancellationToken).ConfigureAwait(false);
             }
             catch (NntpClientRetiredException)
@@ -913,7 +913,7 @@ public class MultiProviderNntpClient(
                         response = await provider.DecodedBodyAsync(
                             segmentId, deferredCallback.Invoke, fallbackAdmissionContext,
                             cancellationToken).ConfigureAwait(false);
-                        await RejectMismatchedYencFileAsync(
+                        await RejectMismatchedFirstSegmentAsync(
                             segmentId, provider.MetricsKey, response, cancellationToken).ConfigureAwait(false);
                         stopwatch.Stop();
                         var responseType = response.ResponseType;
@@ -1280,7 +1280,7 @@ public class MultiProviderNntpClient(
                     if (awaiting) _awaitingBody.TryRemove(KeyValuePair.Create(segmentId, provider));
                 }
 
-                await RejectMismatchedYencFileAsync(
+                await RejectMismatchedFirstSegmentAsync(
                     segmentId, provider.MetricsKey, result, cancellationToken).ConfigureAwait(false);
                 stopwatch.Stop();
                 if (result.ResponseType == successResponseType)
@@ -1477,7 +1477,7 @@ public class MultiProviderNntpClient(
                 MovePendingSelection(ref attemptReserved, provider, operation);
                 walk.Attempts++;
                 var result = await task(provider, admissionFailoverContext, cancellationToken).ConfigureAwait(false);
-                await RejectMismatchedYencFileAsync(
+                await RejectMismatchedFirstSegmentAsync(
                     articleId, provider.MetricsKey, result, cancellationToken).ConfigureAwait(false);
                 stopwatch.Stop();
 
@@ -1609,14 +1609,14 @@ public class MultiProviderNntpClient(
         throw new InvalidOperationException("There are no usenet providers configured.");
     }
 
-    private static async Task RejectMismatchedYencFileAsync(
+    private static async Task RejectMismatchedFirstSegmentAsync(
         SegmentId? requestedId,
         string providerKey,
         UsenetResponse response,
         CancellationToken cancellationToken)
     {
         if (requestedId is not { } segmentId
-            || YencFileValidationContext.CurrentExpectedTotalParts is not { } expectedTotalParts)
+            || !YencFileValidationContext.IsFirstSegmentProbe)
             return;
 
         var bodyStream = response switch
@@ -1646,24 +1646,17 @@ public class MultiProviderNntpClient(
             throw;
         }
 
-        if (header is null || YencFileValidationContext.MatchesExpectedFile(header, segmentId.ToString()))
+        if (header is null || header.PartOffset == 0)
             return;
 
         YencFileValidationContext.Current?.ReportMismatch(
             segmentId.ToString(), providerKey, response.ResponseCode, header);
         await bodyStream.DisposeAsync().ConfigureAwait(false);
 
-        if (YencFileValidationContext.IsFirstSegmentProbe)
-            throw new UsenetMismatchedArticleException(
-                segmentId,
-                $"Provider returned yEnc part {header.PartNumber}/{header.TotalParts} starting at byte " +
-                $"{header.PartOffset} for a file's first segment.");
-
         throw new UsenetMismatchedArticleException(
             segmentId,
-            header.PartNumber,
-            header.TotalParts,
-            expectedTotalParts);
+            $"Provider returned yEnc part {header.PartNumber}/{header.TotalParts} starting at byte " +
+            $"{header.PartOffset} for a file's first segment.");
     }
 
     private bool IsCachedMissing(SegmentId segmentId, MultiConnectionNntpClient provider,

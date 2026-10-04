@@ -390,7 +390,7 @@ public sealed class SegmentCacheNntpClient : WrappingNntpClient
             if (header == null
                 || header.PartSize != entry.Size
                 || !IsCoherentHeader(header)
-                || !YencFileValidationContext.MatchesExpectedFile(header, id))
+                || (YencFileValidationContext.IsFirstSegmentProbe && header.PartOffset != 0))
             {
                 RecordReadFailureAndDrop(hash);
                 return CacheLookupResult.ReadFailure;
