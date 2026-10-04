@@ -217,6 +217,66 @@ public class ArrLinkedRepairDecisionTests
     }
 
     [Fact]
+    public async Task MissingDownloadHistory_OptInRemovesAndSearchesWithoutBlocklist()
+    {
+        var client = new ScriptedArrClient(
+            host: "http://radarr",
+            rootFolders: () => Task.FromResult(new List<ArrRootFolder>
+            {
+                new() { Path = "/media/movies" },
+            }),
+            removeAndBlocklist: (_, _) =>
+                Task.FromResult(ArrRepairOutcome.DownloadHistoryNotFound),
+            removeWithoutBlocklist: _ =>
+                Task.FromResult(ArrMissingPayloadCleanupOutcome.RemovedSearchRequested));
+
+        var result = await HealthCheckService.DecideArrLinkedRepairAsync(
+            [client],
+            LibraryPath,
+            DownloadId,
+            CancellationToken.None,
+            allowUnverifiedReplacement: true);
+
+        Assert.Equal(
+            HealthCheckService.ArrLinkedRepairDecision.RemoveWithoutBlocklistSucceeded,
+            result.Decision);
+        Assert.Equal(1, client.UnverifiedRemoveCalls);
+    }
+
+    [Fact]
+    public async Task UnreachableInstance_StillWinsOverOptInUnverifiedReplacement()
+    {
+        var fallbackClient = new ScriptedArrClient(
+            host: "http://radarr",
+            rootFolders: () => Task.FromResult(new List<ArrRootFolder>
+            {
+                new() { Path = "/media/movies" },
+            }),
+            removeAndBlocklist: (_, _) =>
+                Task.FromResult(ArrRepairOutcome.DownloadHistoryNotFound),
+            removeWithoutBlocklist: _ =>
+                Task.FromResult(ArrMissingPayloadCleanupOutcome.RemovedSearchRequested));
+        var clients = new ArrClient[]
+        {
+            new ScriptedArrClient(
+                host: "http://unreachable",
+                rootFolders: () => throw new HttpRequestException("down"),
+                removeAndBlocklist: (_, _) => throw new InvalidOperationException("should not mutate")),
+            fallbackClient,
+        };
+
+        var result = await HealthCheckService.DecideArrLinkedRepairAsync(
+            clients,
+            LibraryPath,
+            DownloadId,
+            CancellationToken.None,
+            allowUnverifiedReplacement: true);
+
+        Assert.Equal(HealthCheckService.ArrLinkedRepairDecision.DeferUnreachable, result.Decision);
+        Assert.Equal(0, fallbackClient.UnverifiedRemoveCalls);
+    }
+
+    [Fact]
     public async Task NoMatchingRoot_ReturnsRootPathMismatchWithoutCallingArrRepair()
     {
         const string localPath = "/mnt/data/tv/Example/Example.S01E01.mkv";
@@ -964,10 +1024,12 @@ public class ArrLinkedRepairDecisionTests
         Func<string, Guid, Task<ArrRepairOutcome>> removeAndBlocklist,
         Func<string, Task<ArrMediaFileMatch?>>? findMediaFile = null,
         Func<ArrMediaFileMatch, int, int, Task<ArrHistory>>? importHistory = null,
-        Func<ArrMediaFileMatch, Guid, Task<ArrRepairOutcome>>? removeAndBlocklistMatch = null)
+        Func<ArrMediaFileMatch, Guid, Task<ArrRepairOutcome>>? removeAndBlocklistMatch = null,
+        Func<ArrMediaFileMatch, Task<ArrMissingPayloadCleanupOutcome>>? removeWithoutBlocklist = null)
         : ArrClient(host, "test-key")
     {
         public List<Guid> BlocklistDownloadIds { get; } = [];
+        public int UnverifiedRemoveCalls { get; private set; }
 
         public override Task<List<ArrRootFolder>> GetRootFolders(CancellationToken ct) => rootFolders();
 
@@ -1005,6 +1067,16 @@ public class ArrLinkedRepairDecisionTests
             return removeAndBlocklistMatch is not null
                 ? removeAndBlocklistMatch(mediaFile, downloadId)
                 : removeAndBlocklist(LibraryPath, downloadId);
+        }
+
+        public override Task<ArrMissingPayloadCleanupOutcome> RemoveMissingPayloadAndSearchAsync(
+            ArrMediaFileMatch match,
+            Func<IReadOnlyList<string>, bool>? shouldRequestSearch = null,
+            CancellationToken ct = default)
+        {
+            UnverifiedRemoveCalls++;
+            return removeWithoutBlocklist?.Invoke(match)
+                ?? Task.FromResult(ArrMissingPayloadCleanupOutcome.MediaItemNotFound);
         }
     }
 }
