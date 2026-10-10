@@ -2,7 +2,6 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using NzbWebDAV.Clients.Usenet;
-using NzbWebDAV.Clients.Usenet.Contexts;
 using NzbWebDAV.Clients.Usenet.Models;
 using NzbWebDAV.Models;
 using NzbWebDAV.Streams;
@@ -15,11 +14,11 @@ namespace NzbWebDAV.Tests.Clients.Usenet;
 public sealed class SegmentCacheNntpClientTests
 {
     [Theory]
-    [InlineData(false, true)]
-    [InlineData(true, false)]
-    [InlineData(null, false)]
-    public async Task DecodedBodyAsync_CachedZeroTotal_OnlyUsesConfirmedOmission(
-        bool? hasTotalParts, bool expectCacheHit)
+    [InlineData(false)]
+    [InlineData(true)]
+    [InlineData(null)]
+    public async Task DecodedBodyAsync_CachedZeroTotal_UsesCacheRegardlessOfTotalMetadata(
+        bool? hasTotalParts)
     {
         var cacheDir = NewCacheDir();
         const string segmentId = "omitted-total";
@@ -46,17 +45,15 @@ public sealed class SegmentCacheNntpClientTests
                 });
             using var client = new SegmentCacheNntpClient(inner, cacheDir, maxBytes: 1024 * 1024);
             await client.CatalogLoadTask.WaitAsync(TimeSpan.FromSeconds(5));
-            using var validation = YencFileValidationContext.Begin(3);
 
             var response = await client.DecodedBodyAsync(segmentId, CancellationToken.None);
             await using var responseStream = response.Stream!;
             using var output = new MemoryStream();
             await responseStream.CopyToAsync(output);
 
-            Assert.Equal(expectCacheHit ? cachedContent : liveContent, output.ToArray());
-            Assert.Equal(expectCacheHit ? 0 : 1, inner.BodyRequestCount);
-            if (expectCacheHit)
-                Assert.False((await responseStream.GetYencHeadersAsync())!.HasTotalParts);
+            Assert.Equal(cachedContent, output.ToArray());
+            Assert.Equal(0, inner.BodyRequestCount);
+            Assert.Equal(hasTotalParts, (await responseStream.GetYencHeadersAsync())!.HasTotalParts);
         }
         finally
         {
@@ -65,7 +62,7 @@ public sealed class SegmentCacheNntpClientTests
     }
 
     [Fact]
-    public async Task DecodedBodyAsync_CachedHeaderFromDifferentPost_RefetchesFromProvider()
+    public async Task DecodedBodyAsync_CachedHeaderFromDifferentPost_IsServedFromCache()
     {
         var cacheDir = NewCacheDir();
         const string segmentId = "segment-1";
@@ -94,14 +91,13 @@ public sealed class SegmentCacheNntpClientTests
             using var client = new SegmentCacheNntpClient(
                 inner, cacheDir, maxBytes: 1024 * 1024);
             await client.CatalogLoadTask.WaitAsync(TimeSpan.FromSeconds(5));
-            using var validation = YencFileValidationContext.Begin(expectedTotalParts: 3);
 
             var response = await client.DecodedBodyAsync(segmentId, CancellationToken.None);
             await using var output = new MemoryStream();
             await response.Stream!.CopyToAsync(output);
 
-            Assert.Equal(liveContent, output.ToArray());
-            Assert.Equal(1, inner.BodyRequestCount);
+            Assert.Equal(staleContent, output.ToArray());
+            Assert.Equal(0, inner.BodyRequestCount);
         }
         finally
         {
