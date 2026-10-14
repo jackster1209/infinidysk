@@ -1,5 +1,4 @@
 using NzbWebDAV.Clients.Usenet;
-using NzbWebDAV.Clients.Usenet.Contexts;
 using NzbWebDAV.Clients.Usenet.Models;
 using UsenetSharp.Models;
 
@@ -24,19 +23,18 @@ public class HeaderCachingNntpClientTests
     }
 
     [Fact]
-    public async Task GetYencHeadersAsync_CachedHeaderFromDifferentPost_IsRefetched()
+    public async Task GetYencHeadersAsync_CachedHeader_IsReusedRegardlessOfTotalParts()
     {
         var inner = new CountingHeaderClient { TotalParts = 931 };
         var client = new HeaderCachingNntpClient(inner);
 
-        var stale = await client.GetYencHeadersAsync("segment-1", CancellationToken.None);
+        var first = await client.GetYencHeadersAsync("segment-1", CancellationToken.None);
         inner.TotalParts = 3;
-        using var validation = YencFileValidationContext.Begin(expectedTotalParts: 3);
-        var corrected = await client.GetYencHeadersAsync("segment-1", CancellationToken.None);
+        var second = await client.GetYencHeadersAsync("segment-1", CancellationToken.None);
 
-        Assert.Equal(931, stale.TotalParts);
-        Assert.Equal(3, corrected.TotalParts);
-        Assert.Equal(2, inner.HeaderRequestCount);
+        Assert.Equal(931, first.TotalParts);
+        Assert.Equal(931, second.TotalParts);
+        Assert.Equal(1, inner.HeaderRequestCount);
     }
 
     private sealed class CountingHeaderClient : NntpClient

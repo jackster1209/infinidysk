@@ -13,6 +13,7 @@ const baseConfig: Record<string, string> = {
   "repair.healthcheck-aging": "false",
   "repair.auto-remove-after-failures": "0",
   "repair.auto-remove-unlinked-only": "true",
+  "repair.allow-unverified-arr-replacement": "false",
   "repair.par2-enabled": "false",
   "repair.par2-preferred-over-arr": "true",
   "repair.par2-max-missing-slices": "8",
@@ -42,6 +43,11 @@ describe("Repairs settings helpers", () => {
 
   it("detects PAR2 setting changes", () => {
     const updated = { ...baseConfig, "repair.par2-enabled": "true" };
+    expect(isRepairsSettingsUpdated(baseConfig, updated)).toBe(true);
+  });
+
+  it("detects unverified Arr replacement setting changes", () => {
+    const updated = { ...baseConfig, "repair.allow-unverified-arr-replacement": "true" };
     expect(isRepairsSettingsUpdated(baseConfig, updated)).toBe(true);
   });
 

@@ -29,7 +29,12 @@ RUN npm prune --omit=dev
 # Built on the target platform so linux-musl-* consumers (Alpine .NET images)
 # get a real musl binary rather than a glibc fallback via the RID graph.
 FROM alpine:${ALPINE_VERSION} AS rapidyenc-musl
-RUN apk add --no-cache build-base cmake ninja
+RUN for attempt in 1 2 3; do \
+        if apk add --no-cache build-base cmake ninja; then break; fi; \
+        if [ "$attempt" -eq 3 ]; then exit 1; fi; \
+        echo "Alpine build package installation failed; retrying in 5 seconds (attempt $attempt/3)." >&2; \
+        sleep 5; \
+    done
 WORKDIR /src
 COPY ./libs/rapidyenc/ ./
 # Build into a directory outside the copied sources: a host-built librapidyenc.so
@@ -114,7 +119,12 @@ LABEL org.opencontainers.image.licenses=MIT
 # Prepare environment
 WORKDIR /app
 RUN mkdir /config \
-    && apk add --no-cache nodejs npm libc6-compat shadow su-exec bash curl tzdata
+    && for attempt in 1 2 3; do \
+        if apk add --no-cache nodejs npm libc6-compat shadow su-exec bash curl tzdata; then break; fi; \
+        if [ "$attempt" -eq 3 ]; then exit 1; fi; \
+        echo "Alpine runtime package installation failed; retrying in 5 seconds (attempt $attempt/3)." >&2; \
+        sleep 5; \
+    done
 
 # Copy frontend
 COPY --from=frontend-build /frontend/node_modules ./frontend/node_modules
